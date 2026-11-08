@@ -53,7 +53,7 @@ def is_duplicate_map_update(location_key: str, new_status: str) -> dict | None:
 # Pemrosesan utama
 # ---------------------------------------------------------------------------
 def process_audio_result(audio_path: Path | str, trans: dict, analysis: dict, cfg: dict,
-                         source: str = "upload") -> dict:
+                         source: str = "upload", auto_apply: bool = False) -> dict:
     """Simpan transkrip + laporan + jalankan aksi. Return ringkasan untuk UI."""
     out: dict = {"steps": [], "ticket": None, "alert": None, "map_update": None,
                  "duplicate_ticket": None, "duplicate_map_update": None}
@@ -119,7 +119,7 @@ def process_audio_result(audio_path: Path | str, trans: dict, analysis: dict, cf
         return out
 
     out["steps"].append(f"Laporan #{report_id} dibuat ({analysis.get('category')}).")
-    act = run_action(report_id, analysis, trans["text"])
+    act = run_action(report_id, analysis, trans["text"], auto_apply=auto_apply)
     out["steps"].extend(act["steps"])
     for k in ("ticket", "alert", "map_update", "duplicate_ticket",
               "duplicate_map_update", "status_candidate"):
@@ -175,7 +175,8 @@ def process_text_result(text: str, analysis: dict, cfg: dict) -> dict:
     return out
 
 
-def run_action(report_id: int, analysis: dict, text: str) -> dict:
+def run_action(report_id: int, analysis: dict, text: str,
+               auto_apply: bool = False) -> dict:
     """Aturan otomatisasi. Return dict berisi langkah + objek yang dibuat."""
     action = analysis.get("action", "NONE")
     out: dict = {"steps": [], "ticket": None, "alert": None, "map_update": None,
@@ -234,6 +235,9 @@ def run_action(report_id: int, analysis: dict, text: str) -> dict:
             "Sistem tidak mengirim instruksi penanganan."
         )
         db.log("alert", a_id, "created", {"report_id": report_id}, "system")
+        if auto_apply and action in config.AUTO_APPLY_ACTIONS:
+            out["steps"].append("Diterapkan otomatis (mode dengar terus).")
+            db.log("alert", a_id, "auto_applied", {"action": action}, "system")
 
     elif action == "UPDATE_MAP":
         loc_key = analysis.get("location_key")

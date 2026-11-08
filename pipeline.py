@@ -16,7 +16,8 @@ import ai
 import audio
 
 
-def process_audio(path: str | Path, cfg: dict, source: str = "upload") -> dict:
+def process_audio(path: str | Path, cfg: dict, source: str = "upload",
+                  auto_apply: bool = False) -> dict:
     t0 = time.perf_counter()
     path = Path(path)
     if not path.exists():
@@ -50,13 +51,14 @@ def process_audio(path: str | Path, cfg: dict, source: str = "upload") -> dict:
             path, trans,
             {"llm_valid": False, "action": "NONE", "category": "UNKNOWN",
              "llm_error": str(exc), "llm_raw": "", "llm_seconds": 0},
-            cfg, source,
+            cfg, source, auto_apply=auto_apply,
         )
         out["total_seconds"] = round(time.perf_counter() - t0, 2)
         return out
 
     out["analysis"] = analysis
-    out["action"] = actions.process_audio_result(path, trans, analysis, cfg, source)
+    out["action"] = actions.process_audio_result(path, trans, analysis, cfg, source,
+                                                 auto_apply=auto_apply)
     out["total_seconds"] = round(time.perf_counter() - t0, 2)
     return out
 

@@ -48,6 +48,11 @@ DEFAULTS = {
     "language": "id",
 }
 
+# Aksi yang boleh langsung berlaku di mode dengar-terus ("jalankan terus").
+# Aksi di luar daftar ini TETAP menunggu persetujuan operator:
+#   CREATE_TICKET -> Pending, UPDATE_MAP -> Pending Approval, UPDATE_STATUS -> usulan.
+AUTO_APPLY_ACTIONS = {"CREATE_ALERT"}
+
 
 def load_config() -> dict:
     """Gabungkan default dengan config.json (bila ada)."""
