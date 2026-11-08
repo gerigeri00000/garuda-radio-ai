@@ -7,11 +7,13 @@ test_scenarios.py (baseline 47/47 tidak disentuh).
 from __future__ import annotations
 
 import sys
+import threading
 import time
 
 import actions
 import config
 import database as db
+import pipeline
 
 cfg = config.load_config()
 
@@ -188,17 +190,46 @@ def test_feed_tahan_detail_json_rusak():
 
 
 def test_stop_worker_tidak_hang_saat_antrian_penuh():
-    """Hentikan harus selalu kembali, walau antrian penuh."""
+    """Hentikan harus selalu kembali, walau antrian penuh DAN worker hidup."""
     import loop
     loop.reset_for_test()
+    loop.start_worker(cfg)
     for _ in range(loop.QUEUE_MAX):
         loop.enqueue_clip("x.wav", source="live", _force_duration=5.0)
     t0 = time.time()
-    loop.stop_worker()
+    hasil = loop.stop_worker(timeout=2.0)
     durasi = time.time() - t0
     loop.reset_for_test()
-    return check("stop_worker tidak hang saat antrian penuh", durasi < 2.0,
-                 f"{durasi:.2f}s")
+    return check("stop_worker tidak hang saat antrian penuh & worker hidup",
+                 durasi < 4.0 and isinstance(hasil, dict), f"{durasi:.2f}s")
+
+
+def test_stop_worker_jujur_saat_masih_memproses():
+    """Reviewer Critical #3: 'nonaktif' tidak boleh diucapkan sementara
+    thread masih hidup memproses klip."""
+    import loop
+    loop.reset_for_test()
+    asli = pipeline.process_audio
+    tahan = threading.Event()
+
+    def lambat(*a, **k):
+        tahan.wait(10)
+        raise RuntimeError("uji: proses lambat")
+
+    pipeline.process_audio = lambat
+    try:
+        loop.start_worker(cfg)
+        loop.enqueue_clip("x.wav", source="live", _force_duration=5.0)
+        time.sleep(0.5)  # biarkan worker masuk ke _proses
+        hasil = loop.stop_worker(timeout=0.5)
+    finally:
+        tahan.set()
+        time.sleep(0.3)
+        pipeline.process_audio = asli
+        loop.reset_for_test()
+    return check("stop_worker tidak bohong saat masih memproses",
+                 hasil["stopped"] is False and "menyelesaikan" in hasil["message"],
+                 str(hasil))
 
 
 def test_baris_processing_yatim_ditandai_terputus():
@@ -207,12 +238,42 @@ def test_baris_processing_yatim_ditandai_terputus():
     from pathlib import Path
     p = str(Path("samples") / "mati_di_tengah.wav")
     db.log("loop", None, "processing", {"path": p, "source": "live"}, "system")
-    feed = db.loop_feed(50)
+    feed = db.loop_feed(50, grace_seconds=0)  # anggap sudah lewat masa tenggang
     baris = [r for r in feed if r["ringkas"].endswith("mati_di_tengah.wav")]
     if not baris:
         return check("baris pemrosesan lama ditemukan", False, f"{len(feed)} baris")
     return check("baris processing yatim ditandai Terputus",
                  baris[0]["status"] == "Terputus", baris[0]["status"])
+
+
+def test_klip_baru_diproses_bukan_terputus():
+    """Critical #2: klip yang BARU saja diproses tidak boleh tampil Terputus
+    padahal hasilnya belum ada (masih dikerjakan)."""
+    from pathlib import Path
+    p = str(Path("samples") / "sedang_dikerjakan.wav")
+    db.log("loop", None, "processing", {"path": p, "source": "live"}, "system")
+    feed = db.loop_feed(50)  # masa tenggang default
+    baris = [r for r in feed if r["ringkas"].endswith("sedang_dikerjakan.wav")]
+    if not baris:
+        return check("baris pemrosesan baru ditemukan", False)
+    return check("klip yang masih dikerjakan bukan Terputus",
+                 baris[0]["status"] == "Diproses", baris[0]["status"])
+
+
+def test_processing_yatim_luar_jendela_tampilan_tetap_terdeteksi():
+    """Critical #1: baris yatim harus tetap terdeteksi walau panel hanya
+    menampilkan 30 baris terakhir."""
+    from pathlib import Path
+    p = str(Path("samples") / "crash_lama.wav")
+    db.log("loop", None, "processing", {"path": p, "source": "live"}, "system")
+    for i in range(40):  # banjiri dengan klip lain
+        db.log("loop", None, "queued",
+               {"path": str(Path("samples") / f"banjir_{i}.wav"), "source": "live"},
+               "system")
+    feed = db.loop_feed(30, grace_seconds=0)
+    tampil = [r for r in feed if r["ringkas"].endswith("crash_lama.wav")]
+    return check("panel 30 baris tidak lagi menampilkan baris yatim",
+                 len(tampil) == 0, f"{len(tampil)} baris")
 
 
 def test_baris_processing_selesai_tetap_selesai():
@@ -231,7 +292,6 @@ def test_baris_processing_selesai_tetap_selesai():
             and check("baris processing yang selesai bukan Terputus",
                       all(r["status"] != "Terputus" for r in diproses),
                       str([r["status"] for r in diproses])))
-
 
 def test_klip_tidak_yatim_saat_antrian_penuh_lalu_stop():
     """Reviewer #7/#8: saat antrian penuh, klip yang dipotong harus DICATAT,
@@ -272,6 +332,35 @@ def test_stop_lalu_start_tetap_memproses_klip_baru():
     loop.reset_for_test()
     return check("worker hidup lagi setelah stop lalu start",
                  st["processed"] >= 1, str(st))
+
+
+def test_stop_lalu_start_tidak_menumpuk_worker():
+    """Critical #4: Start->Stop->Start saat pemrosesan lambat tidak boleh
+    menyisakan dua worker hidup yang bersaing di file audio yang sama."""
+    import loop
+    loop.reset_for_test()
+    asli = pipeline.process_audio
+    tahan = threading.Event()
+
+    def lambat(*a, **k):
+        tahan.wait(10)
+        raise RuntimeError("uji: proses lambat")
+
+    pipeline.process_audio = lambat
+    try:
+        loop.start_worker(cfg)
+        loop.enqueue_clip("x.wav", source="live", _force_duration=5.0)
+        time.sleep(0.5)
+        loop.stop_worker(timeout=0.3)   # gagal berhenti: klip masih jalan
+        loop.start_worker(cfg)          # tidak boleh membuat worker kedua
+        hidup = [t for t in threading.enumerate() if t.name == "garuda-live-loop"]
+    finally:
+        tahan.set()
+        time.sleep(0.5)
+        pipeline.process_audio = asli
+        loop.reset_for_test()
+    return check("tidak ada dua worker hidup setelah stop lalu start",
+                 len(hidup) <= 1, f"{len(hidup)} worker")
 
 
 def test_klip_tetap_diproses_setelah_stop_lalu_start():
@@ -339,10 +428,14 @@ def run() -> int:
                test_antrian_penuh_buang_tertua, test_loop_feed_dari_db,
                test_vad_assets_ready_graceful, test_feed_menampilkan_kategori_dan_aksi,
                test_feed_tahan_detail_json_rusak, test_stop_worker_tidak_hang_saat_antrian_penuh,
+               test_stop_worker_jujur_saat_masih_memproses,
                test_baris_processing_yatim_ditandai_terputus,
+               test_klip_baru_diproses_bukan_terputus,
+               test_processing_yatim_luar_jendela_tampilan_tetap_terdeteksi,
                test_baris_processing_selesai_tetap_selesai,
                test_klip_tidak_yatim_saat_antrian_penuh_lalu_stop,
                test_stop_lalu_start_tetap_memproses_klip_baru,
+               test_stop_lalu_start_tidak_menumpuk_worker,
                test_klip_tetap_diproses_setelah_stop_lalu_start,
                test_dua_klip_jadi_dua_baris,
                test_llm_mati_transkrip_tetap_ada):

@@ -234,18 +234,32 @@ def do_start_listening():
 
 def do_stop_listening():
     _LISTENING.clear()
-    loop.stop_worker()
+    hasil = loop.stop_worker()
+    if not hasil["stopped"]:
+        return (f"Mode dengar terus: **{hasil['message']}** "
+                "Klip yang sudah masuk antrian tetap diproses.")
     return "Mode dengar terus: **nonaktif**. Klip yang sudah masuk antrian tetap diproses."
 
 
 def do_ingest_clip(audio_path):
-    """Dipanggil setiap kali satu klip rekaman selesai (mic manual atau VAD)."""
+    """Dipanggil setiap kali satu klip rekaman selesai (mic manual atau VAD).
+
+    Endpoint ini terbuka lewat API Gradio. Karena klip yang masuk diproses
+    dengan auto_apply=True (alert langsung berlaku), ia TIDAK boleh jalan
+    kecuali operator benar-benar sudah menekan Mulai di sesi ini.
+    """
     if not _LISTENING.is_set():
         return "Mode dengar terus nonaktif — klip diabaikan."
     if not audio_path:
         return "Klip kosong — diabaikan."
+    # Endpoint ini terbuka lewat API Gradio, jadi jangan percaya path mentah:
+    # hanya terima berkas audio yang benar-benar ada di disk.
+    berkas = Path(str(audio_path))
+    if not berkas.is_file() or berkas.suffix.lower() not in (
+            ".wav", ".mp3", ".ogg", ".m4a", ".flac", ".webm"):
+        return "❌ Klip ditolak: bukan berkas audio yang sah."
     try:
-        res = loop.enqueue_clip(audio_path, source="live")
+        res = loop.enqueue_clip(berkas, source="live")
     except Exception as exc:
         traceback.print_exc()
         return f"❌ Gagal memasukkan klip: {exc}"
@@ -661,9 +675,12 @@ def build_ui() -> gr.Blocks:
                               [transcript_box, analysis_box, json_box, status_box, *all_outputs])
             btn_text.click(save_transcript_text, [txt_in], [status_box, *all_outputs])
             btn_refresh_main.click(_refresh_all, None, all_outputs)
+            # Mulai: nyalakan VAD browser (klik "Mulai" = izin mic eksplisit).
             btn_listen_on.click(do_start_listening, None, live_status,
+                                js="() => { window.__GARUDA_SET_LISTENING__?.(true); }",
                                 concurrency_limit=None, concurrency_id="garuda_listen")
             btn_listen_off.click(do_stop_listening, None, live_status,
+                                 js="() => { window.__GARUDA_SET_LISTENING__?.(false); }",
                                  concurrency_limit=None, concurrency_id="garuda_listen")
             # Ingest tidak boleh berbagi antrian default dengan timer/LLM: kalau
             # tersendat, transmisi berikutnya tidak pernah masuk dan loop mati diam.
@@ -701,12 +718,19 @@ def build_ui() -> gr.Blocks:
 
 
 VAD_BOOT_JS = """
+<script src="__VAD_BASE__/ort.min.js" type="text/javascript"></script>
 <script src="__VAD_BASE__/vad-web.bundle.min.js" type="text/javascript"></script>
 <script>
 // GARUDA: deteksi suara (VAD) di browser -> memicu tombol rekam gr.Audio.
-// Bundle vad-web adalah UMD, jadi dimuat lewat <script>, BUKAN import().
-// Aset (silero_vad.onnx, vad.worklet.bundle.min.js) dicari relatif ke
-// __webpack_public_path__, yang HARUS di-set ke folder models/vad sebelum load.
+//
+// Kedua pustaka adalah skrip UMD (bukan ES module), jadi WAJIB dimuat lewat
+// <script> biasa sebelum skrip ini. Urutan penting:
+//   1. ort.min.js       -> mendefinisikan window.ort (onnxruntime-web)
+//   2. vad-web.bundle   -> window.vad = factory(window.ort)
+// Tanpa ort, MicVAD.new gagal dan deteksi otomatis tidak pernah menyala.
+//
+// Aset (silero_vad.onnx, vad.worklet.bundle.min.js, ort-wasm-*.wasm) dicari
+// relatif ke src tag <script> vad-web terakhir, yaitu folder models/vad.
 (function () {
   var BASE = "__VAD_BASE__/";
   var log = function () { console.log.apply(console, ["[garuda-vad]"].concat([].slice.call(arguments))); };
@@ -732,36 +756,55 @@ VAD_BOOT_JS = """
     });
   }
 
+  window.__GARUDA_VAD_STATUS__ = "belum";
+
   window.__GARUDA_SET_LISTENING__ = async function (on) {
     try {
       if (on) {
-        if (listening) return true;
+        if (listening) { window.__GARUDA_VAD_STATUS__ = "aktif"; return true; }
+        if (typeof window.ort === "undefined") throw new Error("onnxruntime-web (ort.min.js) tidak termuat");
+        if (!window.vad || !window.vad.MicVAD) throw new Error("bundle vad-web tidak termuat");
         await waitFor(recBtn, 20000);
-        if (!window.vad || !window.vad.MicVAD) throw new Error("bundle vad tidak termuat");
+
+        // Catatan: vad-web 0.0.9 TIDAK punya opsi baseAssetPath/onnxWASMBasePath.
+        // Aset (silero_vad.onnx, worklet) di-resolve dari src tag <script>
+        // vad-web di atas, jadi file itu WAJIB berada di folder models/vad.
+        // Yang bisa diatur hanya lokasi berkas WASM onnxruntime.
+        window.ort.env.wasm.wasmPaths = BASE;
         window.__GARUDA_VAD__ = await window.vad.MicVAD.new({
           onSpeechStart: function () { clickSafe(recBtn()); },
           onSpeechEnd: function () { clickSafe(stopBtn()); },
         });
         await window.__GARUDA_VAD__.start();
         listening = true;
+        window.__GARUDA_VAD_STATUS__ = "aktif";
         log("aktif - mendengarkan suara");
       } else {
-        if (window.__GARUDA_VAD__) {
-          try { window.__GARUDA_VAD__.pause(); } catch (e) {}
-          try { window.__GARUDA_VAD__.destroy ? window.__GARUDA_VAD__.destroy() : null; } catch (e) {}
+        // Hentikan deteksi DAN lepaskan mikrofon, supaya Start berikutnya
+        // tidak menumpuk stream audio.
+        var v = window.__GARUDA_VAD__;
+        if (v) {
+          try { v.pause(); } catch (e) {}
+          try {
+            var st = v.listening ?? v.stream ?? null;
+            if (st && st.getTracks) st.getTracks().forEach(function (t) { t.stop(); });
+            if (v.audioContext && v.audioContext.close) v.audioContext.close();
+          } catch (e) {}
           window.__GARUDA_VAD__ = null;
         }
         listening = false;
+        window.__GARUDA_VAD_STATUS__ = "nonaktif";
         log("nonaktif - mikrofon dilepas");
       }
       return true;
     } catch (e) {
       console.error("[garuda-vad] gagal:", e);
       window.__GARUDA_VAD_ERROR__ = String(e);
+      window.__GARUDA_VAD_STATUS__ = "gagal: " + String(e);
       return false;
     }
   };
-  log("skrip dimuat (menunggu perintah Mulai)");
+  log("skrip dimuat (menunggu tombol Mulai)");
 })();
 </script>
 """

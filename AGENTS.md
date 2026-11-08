@@ -150,24 +150,44 @@ masuk `loop.enqueue_clip()` → satu thread pekerja memanggil
 **Perintah terkait:**
 ```powershell
 .\.venv\Scripts\python.exe setup_models.py vad   # unduh aset VAD (butuh internet, sekali)
-.\.venv\Scripts\python.exe test_live.py          # 19 pemeriksaan mode dengar terus
+.\.venv\Scripts\python.exe test_live.py          # 23 pemeriksaan mode dengar terus
 ```
 
 **Hal-hal yang mudah dirusak saat mengubah `loop.py`:**
 - `stop_worker()` memakai `threading.Event` per-thread, **bukan** sentinel `None` di
   antrian. Sentinel memakan satu slot dan bisa membuat klip berikutnya yatim
-  (terutama saat antrian penuh).
+  (terutama saat antrian penuh). Ia mengembalikan `{"stopped": bool, "message": str}`
+  — bila pemrosesan masih jalan, UI **wajib** bilang "masih menyelesaikan klip",
+  bukan "nonaktif". Worker yang belum berhenti dikembalikan ke registry supaya
+  Start berikutnya tidak menciptakan worker kedua.
 - Setiap klip yang dipotong karena antrian penuh **wajib** dicatat `discarded`
   ke `events_log`; kalau tidak, operator kehilangan jejak transmisi yang hilang.
 - `stop_recording` dan tombol Mulai/Hentikan memakai `concurrency_id` terpisah
   (`garuda_ingest`, `garuda_listen`). Jangan biarkan ingest berbagi antrian default
   dengan timer/LLM — kalau tersendat, loop mati diam-diam.
-- Baris `processing` tanpa penutup ditampilkan sebagai **Terputus** (aplikasi mati
-  di tengah proses). Pemasangannya kronologis per file, bukan berdasarkan id saja.
+- `loop_feed()` membaca 4x lebih banyak baris daripada yang ditampilkan saat
+  memasangkan `processing` dengan penutupnya, lalu hanya mengembalikan `limit`
+  baris teratas. Baris `processing` tanpa penutup baru disebut **Terputus**
+  setelah `grace_seconds` (default 120 s) — kalau tidak, klip yang sedang
+  dikerjakan akan tampil "Terputus" padahal baik-baik saja.
+
+**Hal-hal yang mudah dirusak saat mengubah VAD (`app.py` → `VAD_BOOT_JS`):**
+- vad-web 0.0.9 adalah **UMD**, bukan ES module. `import()` tidak akan pernah
+  menghasilkan `MicVAD`; ia hanya ada sebagai `window.vad` setelah `<script>`.
+- **`ort.min.js` wajib dimuat lebih dulu.** Tanpa `window.ort`, `window.vad` tidak
+  pernah terbentuk dan deteksi otomatis mati tanpa pesan. Urutan benar:
+  `ort.min.js` → `vad-web.bundle.min.js` → skrip GARUDA.
+- v0.0.9 **tidak punya** opsi `baseAssetPath`/`onnxWASMBasePath`. Aset
+  (`silero_vad.onnx`, `vad.worklet.bundle.min.js`) dicari relatif ke `src` tag
+  `<script>` vad-web, jadi kelima aset **harus** berada di `models/vad/`.
+- Hanya `ort.env.wasm.wasmPaths` yang bisa diarahkan manual.
+- VAD baru menyala setelah operator menekan **Mulai** (`js=` pada `click`),
+  karena membuka mikrofon memerlukan izin eksplisit pengguna.
 
 **Belum terverifikasi:** deteksi suara sungguhan di browser (butuh mic manusia).
-Yang sudah terbukti: halaman memuat skrip VAD, kelima aset HTTP 200, dan alur
-klip → antrian → aksi lewat handler langsung.
+Yang sudah terbukti: rantai `ort.min.js` → `vad-web.bundle.min.js` menghasilkan
+`window.vad.MicVAD` berupa fungsi, kelima aset HTTP 200, halaman memuat skrip
+VAD, dan alur klip → antrian → aksi lewat handler langsung.
 
 ---
 

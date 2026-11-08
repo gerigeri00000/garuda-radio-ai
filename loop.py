@@ -152,22 +152,39 @@ def start_worker(cfg: dict) -> None:
         t.start()
 
 
-def stop_worker() -> None:
+def stop_worker(timeout: float = 5.0) -> dict:
     """Minta pekerja berhenti. Klip yang sudah di antrian TIDAK dibuang.
 
     Tidak memakai sentinel di antrian: sentinel bisa memakan satu slot dan
     membuat klip berikutnya yatim, terutama saat antrian penuh.
+
+    Return {"stopped": bool, "message": str}. Bila pemrosesan sedang berjalan
+    lama (LLM 3B bisa 15-30 s), thread belum tentu berhenti dalam `timeout`.
+    JANGAN bilang "nonaktif" pada operator bila masih ada yang berjalan -
+    thread yang tertinggal tetap memproses klip berikutnya.
     """
     global _THREAD
     with _LOCK:
         t = _THREAD
         _THREAD = None
     if t is None or not t.is_alive():
-        return
+        return {"stopped": True, "message": "nonaktif"}
+
     stop = getattr(t, "_garuda_stop", None)
     if stop is not None:
         stop.set()
-    t.join(timeout=5.0)
+    t.join(timeout=timeout)
+
+    if t.is_alive():
+        # Kembalikan ke registry supaya start berikutnya tidak menciptakan
+        # worker kedua yang bersaing di file & hash audio yang sama.
+        with _LOCK:
+            if _THREAD is None:
+                _THREAD = t
+        return {"stopped": False,
+                "message": (f"masih menyelesaikan satu klip (>{timeout:.0f}s). "
+                            "Tekan Hentikan lagi setelah klip ini selesai.")}
+    return {"stopped": True, "message": "nonaktif"}
 
 
 def drain(timeout: float = 60.0) -> None:

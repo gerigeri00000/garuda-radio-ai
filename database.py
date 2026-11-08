@@ -16,7 +16,7 @@ import hashlib
 import json
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -133,6 +133,14 @@ def now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def _parse_waktu(teks) -> datetime | None:
+    """Ubah stempel waktu ISO dari DB menjadi datetime; None bila gagal."""
+    try:
+        return datetime.fromisoformat(str(teks))
+    except (TypeError, ValueError):
+        return None
+
+
 def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(config.DB_PATH, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -206,11 +214,18 @@ def _json_path(detail) -> str:
         return ""
 
 
-def loop_feed(limit: int = 30) -> list[dict]:
+def loop_feed(limit: int = 30, grace_seconds: float = 120.0) -> list[dict]:
     """Umpan mode dengar-terus: transisi antrian + ringkasan laporan terkait.
 
     Dibaca langsung dari database supaya panel UI tetap benar setelah refresh.
+
+    `grace_seconds`: klip yang masih diproses memang belum punya penutup.
+    Baris 'processing' baru disebut "Terputus" bila umurnya melewati batas ini,
+    supaya klip yang sedang berjalan tidak diberi dua status yang bertentangan.
     """
+    # Ambil lebih banyak baris daripada yang ditampilkan: memasangkan
+    # 'processing' dengan penutupnya butuh riwayat, bukan hanya layar terakhir.
+    ambil = max(limit * 4, 120)
     with connect() as conn:
         rows = _rows(conn.execute(
             """SELECT e.id, e.action, e.detail, e.created_at,
@@ -221,7 +236,7 @@ def loop_feed(limit: int = 30) -> list[dict]:
                                 THEN CAST(json_extract(e.detail, '$.report_id') AS INTEGER)
                                 ELSE NULL END
                WHERE e.entity = 'loop'
-               ORDER BY e.id DESC LIMIT ?""", (limit,)).fetchall())
+               ORDER BY e.id DESC LIMIT ?""", (ambil,)).fetchall())
 
     # Baris 'processing' yang belum ditutup berarti aplikasi mati di tengah
     # pemrosesan. Tanpa penanda ini operator akan melihat klip "Diproses"
@@ -231,6 +246,7 @@ def loop_feed(limit: int = 30) -> list[dict]:
     # file yang sama. Dibandingkan kronologis karena id 'processed' bisa lebih
     # kecil dari id 'processing' klip lain saat beberapa worker berjalan.
     terputus: set[int] = set()
+    waktu_baris = {r["id"]: r["created_at"] for r in rows}
     terbuka: dict[str, list[int]] = {}
     for r in sorted(rows, key=lambda x: x["id"]):
         kunci = _json_path(r["detail"]).lower()
@@ -240,13 +256,20 @@ def loop_feed(limit: int = 30) -> list[dict]:
             antre = terbuka.get(kunci)
             if antre:
                 antre.pop(0)  # tutup 'processing' terlama untuk file ini
+
+    # Hanya tandai yatim bila sudah lewat masa tenggang (klip benar-benar
+    # menggantung, bukan sedang dikerjakan).
+    batas = datetime.now() - timedelta(seconds=grace_seconds)
     for antre in terbuka.values():
-        terputus.update(antre)
+        for rid in antre:
+            dibuat = _parse_waktu(waktu_baris.get(rid))
+            if dibuat is None or dibuat < batas:
+                terputus.add(rid)
 
     label = {"queued": "Menunggu", "processing": "Diproses",
              "processed": "Selesai", "failed": "Gagal", "discarded": "Dibuang"}
     out = []
-    for r in rows:
+    for r in rows[:limit]:
         status = "Terputus" if r["id"] in terputus else label.get(r["action"], r["action"])
         out.append({
             "waktu": r["created_at"],
