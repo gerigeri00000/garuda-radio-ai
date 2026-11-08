@@ -32,6 +32,7 @@
 | `ai.py` | prompt, `CATEGORIES/PRIORITIES/ACTIONS`, `analyze()`, `validate()`, `rule_based()`, `AnalysisResult` | ubah prompt/output LLM |
 | `actions.py` | action engine: `process_audio_result()`, anti-duplikasi tiket/map, tulis ke DB | ubah aturan aksi |
 | `pipeline.py` | `process_audio()` / `process_text()` — **satu-satunya jalur** dipakai UI & test | entry baru |
+| `loop.py` | antrian klip mode dengar-terus + thread pekerja; tulis transisi ke `events_log` | ubah antrian/ingest |
 | `map_view.py` | Folium + fallback SVG offline | ubah peta |
 | `reports.py` | rekap + ekspor CSV/PDF | ubah rekap |
 | `app.py` | UI Gradio satu halaman `build_ui()` (6 tab), handler `do_*`, `_refresh_all()` | ubah UI |
@@ -128,6 +129,33 @@ bila hanya membaca kode — katakan terus terang bahwa belum dijalankan.
 - `llama-cpp-python` build CPU saat pengujian → analisis 3B ±15–20 s. Jangan "optimalkan"
   dengan pindah ke API cloud.
 - Jangan menambah dependensi berat tanpa memperbarui `requirements.txt` + langkah `setup.bat`.
+
+---
+
+## 7b. Mode dengar terus (continuous listening)
+
+Alur: VAD browser (`models/vad/`) memicu tombol rekam `gr.Audio` → tiap klip
+masuk `loop.enqueue_clip()` → satu thread pekerja memanggil
+`pipeline.process_audio(..., auto_apply=True)` → panel UI membaca `db.loop_feed()`.
+
+**Aturan yang tidak boleh dilanggar:**
+- `config.AUTO_APPLY_ACTIONS = {"CREATE_ALERT"}` — **hanya** alert yang langsung berlaku.
+  `CREATE_TICKET` tetap `Pending`, `UPDATE_MAP` tetap `Pending Approval`,
+  `UPDATE_STATUS` tetap usulan. Jangan tambah entri tanpa persetujuan manusia.
+- `auto_apply` default `False` di semua fungsi. Jalur manual tidak boleh berubah.
+- Panel antrian dibaca dari DB, bukan dari state memori di `loop.py`.
+- Aset VAD diunduh **hanya** lewat `setup_models.py vad`, tidak pernah saat runtime.
+  Tanpa aset, mode tetap menyala tapi tanpa deteksi otomatis (rekam manual).
+
+**Perintah terkait:**
+```powershell
+.\.venv\Scripts\python.exe setup_models.py vad   # unduh aset VAD (butuh internet, sekali)
+.\.venv\Scripts\python.exe test_live.py          # 12 pemeriksaan mode dengar terus
+```
+
+**Belum terverifikasi:** deteksi suara sungguhan di browser (butuh mic manusia).
+Yang sudah terbukti: halaman memuat skrip VAD, keempat aset HTTP 200, dan alur
+klip → antrian → aksi lewat handler langsung.
 
 ---
 
