@@ -214,6 +214,30 @@ LIVE_COLS = ["Waktu", "Status", "Ringkasan", "Kategori", "Aksi", "ID Laporan"]
 _LISTENING = threading.Event()
 
 
+def vad_report(status):
+    """Terjemahkan status VAD dari browser menjadi pesan yang jujur ke operator.
+
+    Dipanggil berkala setelah Mulai. Tanpa ini, kegagalan memuat WASM atau
+    penolakan izin mikrofon membuat operator melihat "AKTIF" padahal tidak
+    ada suara yang pernah terdeteksi.
+    """
+    status = (status or "belum").strip()
+    if not _LISTENING.is_set():
+        return "Mode dengar terus: **nonaktif**."
+    if status == "aktif":
+        return ("Mode dengar terus: **AKTIF** — bicara ke mikrofon, setiap "
+                "transmisi dipotong & diproses otomatis.")
+    if status.startswith("gagal"):
+        return (f"❌ Mode dengar terus **AKTIF untuk rekam manual**, tetapi "
+                f"deteksi suara otomatis GAGAL: `{status[7:].strip()[:180]}`. "
+                "Periksa izin mikrofon browser, lalu tekan Hentikan dan Mulai lagi.")
+    if status in ("nonaktif", "belum"):
+        return ("⚠️ Mode dengar terus **AKTIF untuk rekam manual**, tetapi "
+                "deteksi suara otomatis belum menyala. Tekan Hentikan lalu Mulai "
+                "lagi dan izinkan akses mikrofon.")
+    return f"Mode dengar terus: **AKTIF** (status deteksi: {status})."
+
+
 def do_start_listening():
     """Nyalakan mode dengar terus (antrian + thread pekerja).
 
@@ -230,6 +254,16 @@ def do_start_listening():
                 "lalu muat ulang halaman.")
     return ("Mode dengar terus: **AKTIF** — bicara ke mikrofon, setiap transmisi "
             "dipotong & diproses otomatis.")
+
+
+def do_start_listening_and_watch():
+    """Mulai mode + nyalakan pemantau status VAD."""
+    return do_start_listening(), gr.Timer(3.0, active=True), gr.Textbox(value="belum")
+
+
+def do_stop_listening_and_watch():
+    """Hentikan mode + matikan pemantau status VAD."""
+    return do_stop_listening(), gr.Timer(3.0, active=False), gr.Textbox(value="nonaktif")
 
 
 def do_stop_listening():
@@ -558,6 +592,9 @@ def build_ui() -> gr.Blocks:
                                               scale=1)
                     btn_listen_off = gr.Button("⏹ Hentikan", scale=1)
                 live_status = gr.Markdown("Mode dengar terus: **nonaktif**.")
+                vad_state = gr.Textbox(value="belum", visible=False,
+                                       elem_id="vad_state", label="status VAD")
+                vad_timer = gr.Timer(3.0, active=False)
                 live_df = gr.Dataframe(headers=LIVE_COLS, value=live_queue_table(),
                                        interactive=False, wrap=True,
                                        elem_id="live_queue")
@@ -676,12 +713,19 @@ def build_ui() -> gr.Blocks:
             btn_text.click(save_transcript_text, [txt_in], [status_box, *all_outputs])
             btn_refresh_main.click(_refresh_all, None, all_outputs)
             # Mulai: nyalakan VAD browser (klik "Mulai" = izin mic eksplisit).
-            btn_listen_on.click(do_start_listening, None, live_status,
-                                js="() => { window.__GARUDA_SET_LISTENING__?.(true); }",
+            # JS mengirim status nyata ke hidden textbox supaya kegagalan
+            # (izin mic ditolak, WASM gagal dimuat) TIDAK diam-diam.
+            btn_listen_on.click(do_start_listening_and_watch, None,
+                                [live_status, vad_timer, vad_state],
+                                js=("() => { window.__GARUDA_SET_LISTENING__?.(true); "
+                                    "return window.__GARUDA_VAD_STATUS__ || 'belum'; }"),
                                 concurrency_limit=None, concurrency_id="garuda_listen")
-            btn_listen_off.click(do_stop_listening, None, live_status,
-                                 js="() => { window.__GARUDA_SET_LISTENING__?.(false); }",
+            btn_listen_off.click(do_stop_listening_and_watch, None,
+                                 [live_status, vad_timer, vad_state],
+                                 js=("() => { window.__GARUDA_SET_LISTENING__?.(false); "
+                                     "return 'nonaktif'; }"),
                                  concurrency_limit=None, concurrency_id="garuda_listen")
+            vad_timer.tick(vad_report, [vad_state], live_status)
             # Ingest tidak boleh berbagi antrian default dengan timer/LLM: kalau
             # tersendat, transmisi berikutnya tidak pernah masuk dan loop mati diam.
             audio_in.stop_recording(do_ingest_clip, [audio_in], [live_status],
@@ -782,14 +826,18 @@ VAD_BOOT_JS = """
       } else {
         // Hentikan deteksi DAN lepaskan mikrofon, supaya Start berikutnya
         // tidak menumpuk stream audio.
+        // Catatan: v.listening adalah boolean, jadi JANGAN dipakai untuk
+        // mengambil stream - v.stream yang berisi MediaStream.
         var v = window.__GARUDA_VAD__;
         if (v) {
           try { v.pause(); } catch (e) {}
+          try { if (v.stream && v.stream.getTracks) v.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
           try {
-            var st = v.listening ?? v.stream ?? null;
-            if (st && st.getTracks) st.getTracks().forEach(function (t) { t.stop(); });
-            if (v.audioContext && v.audioContext.close) v.audioContext.close();
+            if (v.audioNodeVAD && v.audioNodeVAD.entryNode && v.audioNodeVAD.entryNode.disconnect) {
+              v.audioNodeVAD.entryNode.disconnect();
+            }
           } catch (e) {}
+          try { if (v.audioContext && v.audioContext.close) v.audioContext.close(); } catch (e) {}
           window.__GARUDA_VAD__ = null;
         }
         listening = false;

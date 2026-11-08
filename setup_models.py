@@ -140,6 +140,10 @@ VAD_CDN_ASSETS = [
      "ort.min.js"),
     ("https://cdn.jsdelivr.net/npm/onnxruntime-web@{ort}/dist/ort-wasm-simd-threaded.wasm",
      "ort-wasm-simd-threaded.wasm"),
+    # Dipakai bila halaman TIDAK cross-origin isolated (tanpa SharedArrayBuffer):
+    # onnxruntime jatuh ke jalur single-thread dan meminta berkas ini.
+    ("https://cdn.jsdelivr.net/npm/onnxruntime-web@{ort}/dist/ort-wasm-simd.wasm",
+     "ort-wasm-simd.wasm"),
 ]
 
 

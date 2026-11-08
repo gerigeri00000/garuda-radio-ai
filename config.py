@@ -65,6 +65,8 @@ VAD_REQUIRED_FILES = [
     "vad.worklet.bundle.min.js",
     "ort.min.js",
     "ort-wasm-simd-threaded.wasm",
+    # Cadangan untuk halaman tanpa cross-origin isolation (tanpa SAB).
+    "ort-wasm-simd.wasm",
 ]
 
 

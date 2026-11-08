@@ -24,7 +24,9 @@ QUEUE_MAX = 20
 _Q: "queue.Queue[tuple[Path, str]]" = queue.Queue(maxsize=QUEUE_MAX)
 _CFG: dict = {}
 _THREAD: threading.Thread | None = None
+_DETACHED: threading.Thread | None = None  # sudah diminta stop, belum mati
 _LOCK = threading.Lock()
+_STOP_LOCK = threading.Lock()  # serialkan stop_worker
 _STATS = {"queued": 0, "processed": 0, "failed": 0, "discarded": 0}
 
 # Hanya untuk pengujian: proses klip langsung di thread pemanggil.
@@ -138,12 +140,18 @@ def _worker(stop: threading.Event) -> None:
 
 
 def start_worker(cfg: dict) -> None:
-    """Nyalakan satu thread pekerja. Idempotent."""
+    """Nyalakan satu thread pekerja. Idempotent.
+
+    Worker yang sudah diminta berhenti tapi belum mati (_DETACHED) tetap
+    dihitung: menyalakan worker baru di sampingnya akan membuat dua worker
+    bersaing memproses file audio yang sama.
+    """
     global _THREAD
     _CFG.update(cfg)
     with _LOCK:
-        if _THREAD is not None and _THREAD.is_alive():
-            return
+        for t in (_THREAD, _DETACHED):
+            if t is not None and t.is_alive():
+                return
         stop = threading.Event()
         t = threading.Thread(target=_worker, args=(stop,),
                              name="garuda-live-loop", daemon=True)
@@ -163,28 +171,42 @@ def stop_worker(timeout: float = 5.0) -> dict:
     JANGAN bilang "nonaktif" pada operator bila masih ada yang berjalan -
     thread yang tertinggal tetap memproses klip berikutnya.
     """
-    global _THREAD
-    with _LOCK:
-        t = _THREAD
-        _THREAD = None
-    if t is None or not t.is_alive():
-        return {"stopped": True, "message": "nonaktif"}
-
-    stop = getattr(t, "_garuda_stop", None)
-    if stop is not None:
-        stop.set()
-    t.join(timeout=timeout)
-
-    if t.is_alive():
-        # Kembalikan ke registry supaya start berikutnya tidak menciptakan
-        # worker kedua yang bersaing di file & hash audio yang sama.
+    global _THREAD, _DETACHED
+    # Satu stop pada satu waktu: dua klik Hentikan beruntun tidak boleh
+    # saling menimpa registry dan saling membohongi operator.
+    with _STOP_LOCK:
         with _LOCK:
-            if _THREAD is None:
-                _THREAD = t
-        return {"stopped": False,
-                "message": (f"masih menyelesaikan satu klip (>{timeout:.0f}s). "
-                            "Tekan Hentikan lagi setelah klip ini selesai.")}
-    return {"stopped": True, "message": "nonaktif"}
+            t = _THREAD
+            _THREAD = None
+            if t is None:
+                # Worker yang terlepas dari registry tapi belum mati (mis.
+                # Hentikan kedua saat yang pertama masih join). Tanpa ini,
+                # klik Hentikan kedua menjawab "nonaktif" padahal masih proses.
+                t = _DETACHED
+            if t is not None and not t.is_alive():
+                t = None
+                _DETACHED = None
+        if t is None:
+            return {"stopped": True, "message": "nonaktif"}
+
+        stop = getattr(t, "_garuda_stop", None)
+        if stop is not None:
+            stop.set()
+        t.join(timeout=timeout)
+
+        if t.is_alive():
+            # Kembalikan ke registry supaya start berikutnya tidak menciptakan
+            # worker kedua yang bersaing di file & hash audio yang sama.
+            with _LOCK:
+                if _THREAD is None:
+                    _THREAD = t
+                _DETACHED = t
+            return {"stopped": False,
+                    "message": (f"masih menyelesaikan satu klip (>{timeout:.0f}s). "
+                                "Worker akan berhenti sendiri setelah klip ini selesai.")}
+        with _LOCK:
+            _DETACHED = None
+        return {"stopped": True, "message": "nonaktif"}
 
 
 def drain(timeout: float = 60.0) -> None:
@@ -216,9 +238,13 @@ def set_sync_for_test(sync: bool) -> None:
 
 def reset_for_test() -> None:
     """Kosongkan antrian & statistik di antara test."""
-    global _SYNC_FOR_TEST
+    global _SYNC_FOR_TEST, _THREAD, _DETACHED
     _SYNC_FOR_TEST = False
-    stop_worker()
+    stop_worker(timeout=10.0)
+    # Test tidak boleh meninggalkan worker hidup yang memakan klip antar test.
+    with _LOCK:
+        _THREAD = None
+        _DETACHED = None
     while True:
         try:
             _Q.get_nowait()

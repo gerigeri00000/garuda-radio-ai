@@ -232,6 +232,35 @@ def test_stop_worker_jujur_saat_masih_memproses():
                  str(hasil))
 
 
+def test_hentikan_dua_kali_tidak_bohong():
+    """Important #3: klik Hentikan kedua saat yang pertama masih join tidak
+    boleh menjawab 'nonaktif' selama worker masih hidup."""
+    import loop
+    loop.reset_for_test()
+    asli = pipeline.process_audio
+    tahan = threading.Event()
+
+    def lambat(*a, **k):
+        tahan.wait(10)
+        raise RuntimeError("uji: proses lambat")
+
+    pipeline.process_audio = lambat
+    try:
+        loop.start_worker(cfg)
+        loop.enqueue_clip("x.wav", source="live", _force_duration=5.0)
+        time.sleep(0.5)
+        pertama = loop.stop_worker(timeout=0.3)
+        kedua = loop.stop_worker(timeout=0.3)
+    finally:
+        tahan.set()
+        time.sleep(0.5)
+        pipeline.process_audio = asli
+        loop.reset_for_test()
+    return check("Hentikan kedua tidak bilang 'nonaktif' saat masih hidup",
+                 kedua["stopped"] is False,
+                 f"pertama={pertama['stopped']} kedua={kedua['stopped']}")
+
+
 def test_baris_processing_yatim_ditandai_terputus():
     """Aplikasi mati saat klip sedang diproses: baris jangan selamanya
     "Diproses" - operator harus tahu transmisi itu tidak selesai."""
@@ -429,6 +458,7 @@ def run() -> int:
                test_vad_assets_ready_graceful, test_feed_menampilkan_kategori_dan_aksi,
                test_feed_tahan_detail_json_rusak, test_stop_worker_tidak_hang_saat_antrian_penuh,
                test_stop_worker_jujur_saat_masih_memproses,
+               test_hentikan_dua_kali_tidak_bohong,
                test_baris_processing_yatim_ditandai_terputus,
                test_klip_baru_diproses_bukan_terputus,
                test_processing_yatim_luar_jendela_tampilan_tetap_terdeteksi,

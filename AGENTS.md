@@ -150,7 +150,7 @@ masuk `loop.enqueue_clip()` → satu thread pekerja memanggil
 **Perintah terkait:**
 ```powershell
 .\.venv\Scripts\python.exe setup_models.py vad   # unduh aset VAD (butuh internet, sekali)
-.\.venv\Scripts\python.exe test_live.py          # 23 pemeriksaan mode dengar terus
+.\.venv\Scripts\python.exe test_live.py          # 24 pemeriksaan mode dengar terus
 ```
 
 **Hal-hal yang mudah dirusak saat mengubah `loop.py`:**
@@ -182,7 +182,16 @@ masuk `loop.enqueue_clip()` → satu thread pekerja memanggil
   `<script>` vad-web, jadi kelima aset **harus** berada di `models/vad/`.
 - Hanya `ort.env.wasm.wasmPaths` yang bisa diarahkan manual.
 - VAD baru menyala setelah operator menekan **Mulai** (`js=` pada `click`),
-  karena membuka mikrofon memerlukan izin eksplisit pengguna.
+  karena membuka mikrofon memerlukan izin eksplisit pengguna. `js=` mengembalikan
+  `__GARUDA_VAD_STATUS__` ke `vad_state`, lalu `vad_report()` menampilkan
+  kegagalan (izin ditolak / WASM gagal / worklet gagal) ke `live_status`.
+  **Jangan hapus jalur pelaporan ini** — tanpa itu operator melihat "AKTIF"
+  padahal tidak ada suara yang pernah terdeteksi.
+- Saat Hentikan, ambil `v.stream` untuk `getTracks().stop()`.
+  `v.listening` adalah **boolean**, bukan MediaStream — memakainya membuat
+  mikrofon tidak pernah dilepas (bug nyata yang pernah terjadi).
+- `ort-wasm-simd.wasm` ikut diunduh sebagai cadangan untuk halaman tanpa
+  cross-origin isolation (tanpa `SharedArrayBuffer`).
 
 **Belum terverifikasi:** deteksi suara sungguhan di browser (butuh mic manusia).
 Yang sudah terbukti: rantai `ort.min.js` → `vad-web.bundle.min.js` menghasilkan
