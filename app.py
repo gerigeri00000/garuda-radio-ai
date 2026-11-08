@@ -208,6 +208,19 @@ def _refresh_all():
             _tickets_table(), _reports_table(), _map_pending_table(), _alerts_table())
 
 
+LIVE_COLS = ["Waktu", "Status", "Ringkasan", "Kategori", "Aksi", "ID Laporan"]
+
+
+def live_queue_table():
+    """Tabel antrian mode dengar-terus (dibaca dari DB, bukan dari memori)."""
+    try:
+        return [[r["waktu"], r["status"], r["ringkas"], r["kategori"], r["aksi"],
+                 r["report_id"]] for r in db.loop_feed(30)]
+    except Exception:
+        traceback.print_exc()
+        return []
+
+
 def process_audio_fn(audio_file):
     if not audio_file:
         return (gr.update(), analysis_html({}), "", "⚠ Tidak ada audio. Rekam atau unggah dulu.",
@@ -483,6 +496,14 @@ def build_ui() -> gr.Blocks:
                 sample_msg = gr.Markdown("")
                 demo_result = gr.HTML("")
 
+                gr.Markdown("### Antrian mode dengar terus")
+                live_status = gr.Markdown("Mode dengar terus: **nonaktif**.")
+                live_df = gr.Dataframe(headers=LIVE_COLS, value=live_queue_table(),
+                                       interactive=False, wrap=True,
+                                       elem_id="live_queue")
+                gr.Markdown("<span class='muted'>Panel ini terbaca dari database "
+                            "dan memperbarui diri setiap 2 detik.</span>")
+
             # ---------------- Tab 2: Dashboard ----------------
             with gr.Tab("📊 Dashboard"):
                 dashboard_box = gr.HTML(dashboard_html())
@@ -594,6 +615,8 @@ def build_ui() -> gr.Blocks:
                               [transcript_box, analysis_box, json_box, status_box, *all_outputs])
             btn_text.click(save_transcript_text, [txt_in], [status_box, *all_outputs])
             btn_refresh_main.click(_refresh_all, None, all_outputs)
+            live_timer = gr.Timer(2.0, active=True)
+            live_timer.tick(live_queue_table, None, live_df)
             btn_dash_refresh.click(_refresh_all, None, all_outputs)
             btn_seed.click(_seed_wrapper, None, [seed_msg, *all_outputs])
             btn_samples.click(generate_samples_fn, None, sample_msg)

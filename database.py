@@ -17,6 +17,7 @@ import json
 import sqlite3
 import threading
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Iterable
 
 import config
@@ -185,6 +186,44 @@ def recent_log(limit: int = 40) -> list[dict]:
     with connect() as conn:
         return _rows(conn.execute(
             "SELECT * FROM events_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall())
+
+
+def _dari_detail(detail) -> str:
+    """Ambil nama file dari detail JSON untuk baris yang belum punya laporan."""
+    try:
+        d = json.loads(detail) if isinstance(detail, str) else (detail or {})
+        return f"{d.get('source', '')} {Path(d.get('path', '')).name}".strip()
+    except Exception:
+        return ""
+
+
+def loop_feed(limit: int = 30) -> list[dict]:
+    """Umpan mode dengar-terus: transisi antrian + ringkasan laporan terkait.
+
+    Dibaca langsung dari database supaya panel UI tetap benar setelah refresh.
+    """
+    with connect() as conn:
+        rows = _rows(conn.execute(
+            """SELECT e.id, e.action, e.detail, e.created_at,
+                      r.id AS report_id, r.category, r.summary, r.action AS r_action
+               FROM events_log e
+               LEFT JOIN reports r
+                 ON r.id = CAST(json_extract(e.detail, '$.report_id') AS INTEGER)
+               WHERE e.entity = 'loop'
+               ORDER BY e.id DESC LIMIT ?""", (limit,)).fetchall())
+    label = {"queued": "Menunggu", "processing": "Diproses",
+             "processed": "Selesai", "failed": "Gagal", "discarded": "Dibuang"}
+    out = []
+    for r in rows:
+        out.append({
+            "waktu": r["created_at"],
+            "status": label.get(r["action"], r["action"]),
+            "ringkas": (r["summary"] or "")[:120] or _dari_detail(r["detail"]),
+            "kategori": r["category"] or "",
+            "aksi": r["r_action"] or "",
+            "report_id": r["report_id"],
+        })
+    return out
 
 
 # ---------------------------------------------------------------------------

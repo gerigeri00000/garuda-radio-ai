@@ -135,6 +135,20 @@ def test_antrian_penuh_buang_tertua():
     return check("antrian penuh membuang klip tertua", ok, str(stats))
 
 
+def test_loop_feed_dari_db():
+    import loop
+    paths = sorted(config.SAMPLES_DIR.glob("*.wav"))
+    if not paths:
+        return check("dilewati: tidak ada sample audio", True)
+    loop.reset_for_test()
+    loop.set_sync_for_test(True)
+    loop.enqueue_clip(paths[0], source="live")
+    feed = db.loop_feed(30)
+    ok = bool(feed) and all({"waktu", "status", "ringkas"} <= set(r) for r in feed)
+    loop.reset_for_test()
+    return check("feed antrian dibaca dari database", ok, f"{len(feed)} baris")
+
+
 def test_dua_klip_jadi_dua_baris():
     import pipeline
     paths = sorted(config.SAMPLES_DIR.glob("*.wav"))
@@ -180,7 +194,8 @@ def run() -> int:
     for fn in (test_auto_apply_alert, test_map_tetap_pending,
                test_tiket_tetap_pending, test_status_update_tetap_usulan,
                test_jalur_manual_tidak_berubah, test_klip_terlalu_pendek,
-               test_antrian_penuh_buang_tertua, test_dua_klip_jadi_dua_baris,
+               test_antrian_penuh_buang_tertua, test_loop_feed_dari_db,
+               test_dua_klip_jadi_dua_baris,
                test_llm_mati_transkrip_tetap_ada):
         reset_db()
         results.append(fn())
