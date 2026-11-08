@@ -192,14 +192,15 @@ def run() -> int:
             loop.stop_worker(timeout=30)
 
         # --- 5. Durasi dari browser dipakai, bukan hasil probe server -----
+        # Berkasnya ~2 detik, tapi kita kirim 1.9. Pesan server HARUS memuat
+        # angka yang dikirim browser, bukan hasil probe berkas.
         app._LISTENING.set()
         loop.start_worker(config.load_config())
         try:
-            before = len(baris_antrian())
             jalur3 = unggah(wav)
             ok3, pesan3 = panggil(jalur3, 1.9)
-            check("durasi kiriman browser diterima",
-                  ok3 and ("1.9" in pesan3 or "antrian" in pesan3.lower()), pesan3[:160])
+            check("server memakai durasi kiriman browser (1.9), bukan hasil probe",
+                  ok3 and "1.9" in pesan3, pesan3[:160])
         finally:
             app._LISTENING.clear()
             loop.stop_worker(timeout=30)

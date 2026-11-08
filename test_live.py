@@ -9,6 +9,7 @@ from __future__ import annotations
 import sys
 import threading
 import time
+from pathlib import Path
 
 import actions
 import config
@@ -169,29 +170,62 @@ def test_ingest_menolak_saat_mode_nonaktif():
                  "nonaktif" in pesan.lower(), pesan[:80])
 
 
+def _berkas_unggahan_uji(nama: str = "klip.wav") -> Path:
+    """Salin satu sample ke folder unggahan Gradio, seperti hasil upload asli."""
+    import shutil
+    import tempfile
+
+    samples = sorted(config.SAMPLES_DIR.glob("*.wav"))
+    if not samples:
+        return None
+    akar = Path(tempfile.gettempdir()) / "gradio" / "_uji_ingest"
+    akar.mkdir(parents=True, exist_ok=True)
+    tujuan = akar / nama
+    shutil.copyfile(samples[0], tujuan)
+    return tujuan
+
+
+def _hapus_unggahan_uji(berkas: Path) -> None:
+    if not berkas:
+        return
+    try:
+        berkas.unlink()
+        berkas.parent.rmdir()
+    except OSError:
+        pass
+
+
 def test_ingest_pakai_durasi_dari_browser():
     """Durasi dari browser dipakai apa adanya, tanpa probe ulang di server."""
     import app
     import loop
-    paths = sorted(config.SAMPLES_DIR.glob("*.wav"))
-    if not paths:
+    if not sorted(config.SAMPLES_DIR.glob("*.wav")):
         return check("dilewati: tidak ada sample audio", True)
+
+    berkas = _berkas_unggahan_uji()
     loop.reset_for_test()
     app._LISTENING.set()
     try:
         # 0.4 s: di bawah batas, tapi berkasnya sendiri jauh lebih panjang.
         # Kalau server salah memakai durasi hasil probe, klip ini akan lolos.
-        pesan = app.do_ingest_clip(str(paths[0]), 0.4)
+        pesan = app.do_ingest_clip(str(berkas), 0.4)
         ditolak = "pendek" in pesan.lower() or "derau" in pesan.lower()
 
         # Tanpa durasi (None) server harus jatuh ke probe berkas yang asli.
-        pesan2 = app.do_ingest_clip(str(paths[0]), None)
+        pesan2 = app.do_ingest_clip(str(berkas), None)
         dipakai_probe = "antrian" in pesan2.lower()
+
+        # Durasi karangan (99 s) harus diabaikan, bukan dipakai apa adanya.
+        pesan3 = app.do_ingest_clip(str(berkas), 99.0)
+        durasi_liar_diabaikan = "99" not in pesan3
     finally:
         app._LISTENING.clear()
         loop.reset_for_test()
+        _hapus_unggahan_uji(berkas)
     return (check("durasi browser dipakai, bukan hasil probe", ditolak, pesan[:90])
-            and check("tanpa durasi, server probe sendiri", dipakai_probe, pesan2[:90]))
+            and check("tanpa durasi, server probe sendiri", dipakai_probe, pesan2[:90])
+            and check("durasi tidak masuk akal diabaikan", durasi_liar_diabaikan,
+                      pesan3[:90]))
 
 
 def test_ingest_tolak_path_bukan_audio():
@@ -207,6 +241,42 @@ def test_ingest_tolak_path_bukan_audio():
     return (check("path tidak ada ditolak", "ditolak" in p1.lower(), p1[:70])
             and check("berkas non-audio ditolak", "ditolak" in p2.lower(), p2[:70])
             and check("path kosong ditolak", "kosong" in p3.lower(), p3[:70]))
+
+
+def test_ingest_tolak_berkas_di_luar_unggahan():
+    """Berkas audio di disk (mis. rekaman lama) tidak boleh dipicu lewat HTTP.
+
+    Ingest memproses dengan auto_apply=True. Tanpa batas folder, siapa pun
+    yang bisa menjangkau port aplikasi dapat memutar ulang audio apa pun di
+    disk dan memicu alert otomatis dari situ.
+    """
+    import app
+    samples = sorted(config.SAMPLES_DIR.glob("*.wav"))
+    if not samples:
+        return check("dilewati: tidak ada sample audio", True)
+
+    app._LISTENING.set()
+    salinan = None
+    try:
+        ditolak = app.do_ingest_clip(str(samples[0]), 5.0)
+        ditolak_data = app.do_ingest_clip(str(Path("app.py").resolve()), 5.0)
+
+        # Berkas di folder unggahan Gradio HARUS diterima.
+        salinan = _berkas_unggahan_uji("klip_gerbang.wav")
+        diterima = app.do_ingest_clip(str(salinan), 2.0) if salinan else ""
+    finally:
+        app._LISTENING.clear()
+        import loop
+        loop.reset_for_test()
+        _hapus_unggahan_uji(salinan)
+
+    return (check("audio di luar folder unggahan DITOLAK",
+                  "ditolak" in ditolak.lower() and "unggahan" in ditolak.lower(),
+                  ditolak[:90])
+            and check("berkas kode di disk ditolak", "ditolak" in ditolak_data.lower(),
+                      ditolak_data[:70])
+            and check("audio di folder unggahan Gradio DITERIMA",
+                      "antrian" in diterima.lower(), diterima[:90]))
 
 
 def test_status_vad_jujur():
@@ -231,17 +301,33 @@ def test_status_vad_jujur():
             and check("belum menyala diperingatkan", "belum" in diam.lower(), diam[:70]))
 
 
-def test_silence_seconds_masuk_akal():
-    """Sunyi 3 detik harus bisa diterjemahkan jadi jumlah frame VAD."""
-    frame = 1536
-    sr = 16000
-    frames = max(1, round(config.SILENCE_SECONDS * sr / frame))
-    detik = frames * frame / sr
-    return (check("SILENCE_SECONDS positif", config.SILENCE_SECONDS > 0,
-                  str(config.SILENCE_SECONDS))
-            and check("konversi frame mendekati durasi asli",
-                      abs(detik - config.SILENCE_SECONDS) < 0.15,
-                      f"{frames} frame = {detik:.2f}s"))
+def test_gerbang_sunyi_di_browser():
+    """Jalankan uji gerbang sunyi memakai BUNDLE VAD ASLI (node).
+
+    Ini satu-satunya uji yang benar-benar menjalankan logika browser. Ia
+    menangkap: desain lama (VAD mengklik tombol rekam), sunyi menghasilkan
+    klip, transmisi pendek hilang, dan mikrofon bocor saat Hentikan.
+    """
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        return check("dilewati: node tidak tersedia", True)
+    skrip = Path(__file__).with_name("test_vad_gerbang.js")
+    if not skrip.is_file():
+        return check("test_vad_gerbang.js ada", False, str(skrip))
+    try:
+        hasil = subprocess.run([node, str(skrip)], capture_output=True,
+                               text=True, timeout=180, encoding="utf-8",
+                               errors="replace")
+    except subprocess.TimeoutExpired:
+        return check("uji gerbang sunyi selesai", False, "timeout 180s")
+    keluaran = (hasil.stdout or "") + (hasil.stderr or "")
+    baris = [b.strip() for b in keluaran.splitlines() if "HASIL:" in b]
+    return check("uji gerbang sunyi browser lulus 14/14",
+                 hasil.returncode == 0 and bool(baris) and "14/14" in baris[-1],
+                 baris[-1] if baris else keluaran[-200:])
 
 
 def test_feed_menampilkan_kategori_dan_aksi():
@@ -566,8 +652,9 @@ def run() -> int:
                test_ingest_menolak_saat_mode_nonaktif,
                test_ingest_pakai_durasi_dari_browser,
                test_ingest_tolak_path_bukan_audio,
+               test_ingest_tolak_berkas_di_luar_unggahan,
                test_status_vad_jujur,
-               test_silence_seconds_masuk_akal,
+               test_gerbang_sunyi_di_browser,
                test_feed_menampilkan_kategori_dan_aksi,
                test_feed_tahan_detail_json_rusak, test_stop_worker_tidak_hang_saat_antrian_penuh,
                test_stop_worker_jujur_saat_masih_memproses,

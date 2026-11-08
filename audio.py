@@ -1,7 +1,7 @@
 """
 GARUDA Radio AI - audio & speech-to-text (faster-whisper, 100% offline).
 
-- Audio dari mikrofon Gradio / upload file / file rekaman radio.
+- Audio dari potongan mikrofon (mode dengar terus), upload file, atau rekaman radio.
 - Dikonversi ke 16 kHz mono WAV lalu ditranskripsikan dengan model lokal.
 - Model TIDAK pernah diunduh otomatis: bila belum ada, raise ModelNotInstalled.
 """

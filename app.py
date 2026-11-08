@@ -152,7 +152,9 @@ def approval_html() -> str:
 
 def analysis_html(res: dict) -> str:
     if not res:
-        return "<div class='muted'>Belum ada analisis. Rekam atau unggah audio, lalu tekan Proses.</div>"
+        return ("<div class='muted'>Belum ada analisis. Tekan "
+                "<b>Mulai dengar terus</b> agar mikrofon diproses otomatis, "
+                "atau unggah file audio lama lalu tekan Proses audio.</div>")
     trans = res.get("transcript", "")
     an = res.get("analysis") or {}
     act = res.get("action") or {}
@@ -282,6 +284,39 @@ def do_stop_listening():
     return "Status: **nonaktif**. Potongan yang sudah masuk antrian tetap diproses."
 
 
+def _folder_unggahan_gradio() -> list[Path]:
+    """Folder tempat Gradio menaruh berkas hasil unggahan.
+
+    Dipakai untuk MEMBATASI berkas mana yang boleh diproses lewat endpoint
+    ingest. Tanpa batas ini, siapa pun yang bisa menjangkau port aplikasi
+    (selagi mode menyala) dapat menyuruh GARUDA memutar ulang audio apa pun
+    di disk - termasuk rekaman lama operator lain - dan memicu alert
+    otomatis dari situ.
+    """
+    import tempfile
+    akar = [config.DATA_DIR / "unggahan"]
+    tmp = Path(tempfile.gettempdir()) / "gradio"
+    if tmp.exists():
+        akar.append(tmp)
+    return akar
+
+
+def _berkas_unggahan_sah(berkas: Path) -> bool:
+    """True bila berkas berada di folder unggahan Gradio (atau data kita)."""
+    try:
+        nyata = berkas.resolve()
+    except OSError:
+        return False
+    for akar in _folder_unggahan_gradio():
+        try:
+            akar_nyata = akar.resolve()
+        except OSError:
+            continue
+        if nyata == akar_nyata or akar_nyata in nyata.parents:
+            return True
+    return False
+
+
 def do_ingest_clip(audio_path, durasi=None):
     """Terima satu potongan transmisi dari browser dan masukkan ke antrian.
 
@@ -289,22 +324,37 @@ def do_ingest_clip(audio_path, durasi=None):
     Tidak ada tombol yang perlu ditekan operator.
 
     Endpoint ini terbuka lewat HTTP. Karena klip yang masuk diproses dengan
-    auto_apply=True (alert langsung berlaku), ia TIDAK boleh jalan kecuali
-    operator sudah menekan Mulai di sesi ini.
+    auto_apply=True (alert langsung berlaku), ada tiga penjagaan:
+      1. mode harus menyala (operator sudah menekan Mulai),
+      2. berkas harus benar-benar hasil unggahan Gradio, bukan path sembarang,
+      3. hanya ekstensi audio yang diterima.
     """
     if not _LISTENING.is_set():
         return "Mode dengar terus nonaktif — potongan diabaikan."
     if not audio_path:
         return "Potongan kosong — diabaikan."
-    # Jangan percaya path mentah dari browser: hanya terima audio yang nyata.
+    # Jangan percaya path mentah dari browser.
     berkas = Path(str(audio_path))
     if not berkas.is_file() or berkas.suffix.lower() not in (
             ".wav", ".mp3", ".ogg", ".m4a", ".flac", ".webm"):
         return "❌ Klip ditolak: bukan berkas audio yang sah."
+    if not _berkas_unggahan_sah(berkas):
+        return ("❌ Klip ditolak: berkas bukan hasil unggahan sesi ini. "
+                "Hanya transmisi dari mikrofon yang boleh diproses otomatis.")
     try:
         paksa = float(durasi) if durasi is not None else None
     except (TypeError, ValueError):
         paksa = None
+    # Durasi kiriman browser tidak boleh dipakai untuk memalsukan panjang klip.
+    # Batas atas longgar (10 menit) sudah cukup menolak nilai karangan, dan
+    # durasi yang jauh melebihi isi berkas dianggap tidak masuk akal.
+    if paksa is not None:
+        if not (0 < paksa <= 600):
+            paksa = None
+        else:
+            nyata = loop._durasi(berkas)
+            if nyata > 0 and paksa > nyata * 1.5 + 1.0:
+                paksa = None
     try:
         res = loop.enqueue_clip(berkas, source="live", _force_duration=paksa)
     except Exception as exc:
@@ -326,7 +376,7 @@ def live_queue_table():
 
 def process_audio_fn(audio_file):
     if not audio_file:
-        return (gr.update(), analysis_html({}), "", "⚠ Tidak ada audio. Rekam atau unggah dulu.",
+        return (gr.update(), analysis_html({}), "", "⚠ Tidak ada audio. Unggah file audio dulu.",
                 *_refresh_all())
     try:
         with _PROC_LOCK:
@@ -824,17 +874,44 @@ VAD_BOOT_JS = """
   var SILENCE_SEC = __SILENCE_SEC__;
   var SUBMIT_PATH = "__SUBMIT_PATH__";
   var log = function () { console.log.apply(console, ["[garuda-vad]"].concat([].slice.call(arguments))); };
-  var state = null;   // { vad, unggah }
-  var diproses = 0;
 
-  // 16000 Hz x 0.096 s per frame; redemptionFrames = berapa frame sunyi
-  // sebelum dianggap selesai bicara.
-  var FRAME_SAMPLES = 1536;
-  var SR = 16000;
-  var REDEMPTION_FRAMES = Math.max(1, Math.round(SILENCE_SEC * SR / FRAME_SAMPLES));
+  var FRAME_SAMPLES = 1536;      // frameSamples bawaan pustaka
+  var SR = 16000;                // sample rate keluaran pustaka
+  var FRAME_SEC = FRAME_SAMPLES / SR;   // 0,096 s per frame
+
+  // Dua hal BERBEDA yang jangan dicampur:
+  //
+  //  1. REDEMPTION_FRAMES = kapan pustaka menganggap "bicara selesai".
+  //     Ini harus PENDEK (~0,77 s). Kalau dibuat 3 detik, setiap transmisi
+  //     pendek ("Alfa, terima") menunggu 3 detik sunyi dulu baru ditutup,
+  //     sehingga transmisi yang berjeda <3 detik DIGABUNG jadi satu klip
+  //     raksasa, dan jeda napas memecah/menghapus klip.
+  //
+  //  2. GERBANG_SUNYI = kapan KITA mengirim klip, yaitu setelah sunyi
+  //     SILENCE_SEC. Bila transmisi baru datang sebelum gerbang lepas,
+  //     segmennya digabung dengan segmen yang sedang menunggu - persis
+  //     seperti operator radio mendengar satu kalimat utuh.
+  var REDEMPTION_FRAMES = 8;
+
+  var state = null;      // { vad } setelah mikrofon benar-benar aktif
+  var pending = null;    // MicVAD yang sedang dibuat (belum boleh dianggap aktif)
+  var generasi = 0;      // dinaikkan tiap Mulai/Hentikan; membatalkan init usang
+  var terkirim = 0;
+  var gagal = 0;
+
+  // Gerbang sunyi dihitung dalam FRAME (0,096 s), bukan detik jam dinding.
+  var SILENCE_FRAMES = Math.max(1, Math.round(SILENCE_SEC / FRAME_SEC));   // 3 s -> 31
+  var BATAS_BICARA = 0.5;   // positiveSpeechThreshold bawaan pustaka
+
+  // Penampung transmisi yang menunggu gerbang sunyi.
+  var segmen = [];        // daftar { audio: Float32Array, ekor: frame sunyi di ujung }
+  var sunyiFrame = 0;     // frame sunyi berturut-turut setelah segmen terakhir
 
   window.__GARUDA_VAD_STATUS__ = "belum";
   window.__GARUDA_VAD_INFO__ = "";
+
+  function setStatus(s) { window.__GARUDA_VAD_STATUS__ = s; }
+  function setInfo(s) { window.__GARUDA_VAD_INFO__ = s; }
 
   // Float32Array 16 kHz -> WAV 16-bit mono -> Blob
   function keWav(float32) {
@@ -864,8 +941,28 @@ VAD_BOOT_JS = """
     return new Blob([buf], { type: "audio/wav" });
   }
 
-  // Kirim satu potongan ke endpoint Gradio. Gradio 6 memakai protokol
-  // upload -> SSE POST -> stream hasil.
+  // Baca hasil dari endpoint call. Gradio menjawab POST dengan {event_id},
+  // hasil sebenarnya ada di GET .../<event_id> sebagai SSE. Tanpa ini,
+  // penolakan server (mis. mode sudah nonaktif) tidak pernah terlihat dan
+  // kita akan berbohong "terkirim".
+  async function bacaHasil(eventId) {
+    try {
+      var r = await fetch(SUBMIT_PATH + "/" + encodeURIComponent(eventId));
+      if (!r.ok || !r.body) return "";
+      var teks = await r.text();
+      var akhir = "";
+      teks.split("\\n").forEach(function (baris) {
+        if (baris.indexOf("data:") === 0) {
+          var isi = baris.slice(5).trim();
+          if (isi && isi !== "null") akhir = isi;
+        }
+      });
+      return akhir;
+    } catch (e) {
+      return "";
+    }
+  }
+
   async function kirim(blob, detik) {
     var nama = "garuda-" + Date.now() + ".wav";
     var fd = new FormData();
@@ -884,59 +981,166 @@ VAD_BOOT_JS = """
     if (!r.ok) throw new Error("kirim gagal HTTP " + r.status);
     var j = await r.json();
     if (j && j.error) throw new Error(String(j.error));
-    log("potongan " + detik.toFixed(1) + " s terkirim ke antrian");
-    return j;
+
+    // Tunggu hasil sungguhan, supaya penolakan server tidak dianggap sukses.
+    var hasil = j && j.event_id ? await bacaHasil(j.event_id) : "";
+    if (hasil) {
+      var pesan = hasil;
+      try { pesan = JSON.parse(hasil); } catch (e) {}
+      if (Array.isArray(pesan)) pesan = pesan[0];
+      pesan = String(pesan || "");
+      if (/nonaktif|ditolak|pendek|Gagal/i.test(pesan)) throw new Error(pesan.slice(0, 140));
+    }
+    log("transmisi " + detik.toFixed(1) + " s terkirim ke antrian");
+    return hasil;
   }
 
-  function setStatus(s) { window.__GARUDA_VAD_STATUS__ = s; }
-  function setInfo(s) { window.__GARUDA_VAD_INFO__ = s; }
+  // Kirim semua segmen yang menunggu sebagai SATU klip.
+  function lepasGerbang() {
+    if (!segmen.length) return;
+    var total = 0;
+    segmen.forEach(function (s) { total += s.audio.length; });
+    var gab = new Float32Array(total);
+    var o = 0;
+    segmen.forEach(function (s) { gab.set(s.audio, o); o += s.audio.length; });
+
+    // Buang sunyi ekor segmen terakhir; sunyi itulah yang memicu pengiriman
+    // dan tidak berisi apa pun. Simpan sampai kata terakhir.
+    var ekor = segmen[segmen.length - 1].ekor * FRAME_SAMPLES;
+    var potong = Math.min(ekor, Math.max(0, gab.length - 1));
+    var bersih = potong > 0 ? gab.subarray(0, gab.length - potong) : gab;
+
+    segmen = [];
+    sunyiFrame = 0;
+
+    var detik = bersih.length / SR;
+    if (detik < 0.2) {   // sisa derau, bukan transmisi
+      // Jangan buang diam-diam: catat supaya operator bisa membedakan
+      // "tidak ada suara" dari "suara terlalu pendek".
+      log("segmen " + detik.toFixed(2) + " s diabaikan (terlalu pendek)");
+      return;
+    }
+    setInfo("mengirim transmisi " + detik.toFixed(1) + " s...");
+    kirim(keWav(bersih), detik).then(function () {
+      terkirim += 1;
+      setInfo("mendengarkan (" + terkirim + " transmisi terkirim)");
+    }).catch(function (e) {
+      gagal += 1;
+      console.error("[garuda-vad] kirim gagal:", e);
+      setInfo("GAGAL mengirim: " + String(e).slice(0, 120));
+    });
+  }
+
+  // Gerbang sunyi berbasis FRAME, bukan jam dinding. Dipanggil pustaka
+  // untuk setiap frame lewat onFrameProcessed, jadi hitungannya mengikuti
+  // audio yang benar-benar masuk - tidak meleset saat tab di-latar atau
+  // saat thread sibuk.
+  function periksaGerbang() {
+    if (!segmen.length) return;
+    if (sunyiFrame < SILENCE_FRAMES) return;
+    lepasGerbang();
+  }
+
+  function bereskan(v) {
+    if (!v) return;
+    try { v.pause(); } catch (e) {}
+    try {
+      if (v.stream && v.stream.getTracks) v.stream.getTracks().forEach(function (t) { t.stop(); });
+    } catch (e) {}
+    try {
+      if (v.audioNodeVAD && v.audioNodeVAD.entryNode && v.audioNodeVAD.entryNode.disconnect) {
+        v.audioNodeVAD.entryNode.disconnect();
+      }
+    } catch (e) {}
+    try { if (v.audioContext && v.audioContext.close) v.audioContext.close(); } catch (e) {}
+  }
 
   window.__GARUDA_SET_LISTENING__ = async function (on) {
+    var gen = ++generasi;
     try {
       if (on) {
         if (state) { setStatus("aktif"); return true; }
+        if (pending) { setStatus("menyiapkan"); return true; }
         if (typeof window.ort === "undefined") throw new Error("ort.min.js tidak termuat");
         if (!window.vad || !window.vad.MicVAD) throw new Error("vad-web.bundle.min.js tidak termuat");
 
         setStatus("menyiapkan");
         window.ort.env.wasm.wasmPaths = BASE;
-        var vad = await window.vad.MicVAD.new({
-          redemptionFrames: REDEMPTION_FRAMES,   // sunyi N detik = potong
-          onSpeechStart: function () { setInfo("mendengar suara..."); },
-          onVADMisfire: function () { setInfo("mendengarkan"); },
+        segmen = [];
+        sunyiFrame = 0;
+
+        pending = window.vad.MicVAD.new({
+          redemptionFrames: REDEMPTION_FRAMES,
+          // Satu-satunya sumber kebenaran soal sunyi: probabilitas bicara
+          // per frame dari model. Hitungannya tidak bisa meleset karena
+          // tidak bergantung pada timer atau beban thread.
+          onFrameProcessed: function (probs) {
+            if (gen !== generasi) return;
+            var bicara = (probs && probs.isSpeech !== undefined)
+              ? probs.isSpeech : probs;
+            if (typeof bicara !== "number") return;
+            if (bicara >= BATAS_BICARA) {
+              sunyiFrame = 0;
+              return;
+            }
+            if (!segmen.length) return;   // belum ada transmisi, tidak perlu dihitung
+            sunyiFrame += 1;
+            periksaGerbang();
+          },
+          onSpeechStart: function () {
+            if (gen !== generasi) return;
+            setInfo(segmen.length ? "menyambung transmisi..." : "mendengar suara...");
+          },
+          onVADMisfire: function () {
+            if (gen !== generasi) return;
+            setInfo(segmen.length ? "menunggu sunyi " + SILENCE_SEC + " s..." : "mendengarkan");
+          },
           onSpeechEnd: function (audio) {
-            // audio = Float32Array 16 kHz dari pustaka VAD
-            var detik = audio.length / SR;
-            setInfo("memotong transmisi " + detik.toFixed(1) + " s, mengirim...");
-            var blob = keWav(audio);
-            diproses += 1;
-            kirim(blob, detik).then(function () {
-              setInfo("mendengarkan (" + diproses + " transmisi terkirim)");
-            }).catch(function (e) {
-              console.error("[garuda-vad] kirim gagal:", e);
-              setInfo("GAGAL mengirim: " + String(e).slice(0, 120));
-              setStatus("gagal: kirim: " + String(e).slice(0, 120));
-            });
+            if (gen !== generasi) return;
+            // Pustaka sudah menutup segmen setelah REDEMPTION_FRAMES sunyi
+            // dan menyertakan sunyi itu di ujung audio. Catat untuk dipangkas.
+            segmen.push({ audio: audio, ekor: REDEMPTION_FRAMES });
+            sunyiFrame = 0;
+            setInfo("transmisi " + (audio.length / SR).toFixed(1) + " s, menunggu sunyi "
+                    + SILENCE_SEC + " s...");
           },
         });
+
+        var vad;
+        try {
+          vad = await pending;
+        } finally {
+          pending = null;
+        }
+        if (gen !== generasi) {
+          // Hentikan ditekan saat masih menyiapkan: lepas mikrofon yang
+          // terlanjur terbuka, JANGAN klaim aktif.
+          bereskan(vad);
+          log("init dibatalkan karena Hentikan");
+          return false;
+        }
         await vad.start();
-        state = { vad: vad, unggah: true };
+        state = { vad: vad };
         setStatus("aktif");
-        setInfo("mendengarkan");
-        log("aktif - sunyi " + SILENCE_SEC + " s (" + REDEMPTION_FRAMES + " frame) -> potong & proses");
+        setInfo("mendengarkan (sunyi " + SILENCE_SEC + " s = potong & proses)");
+        log("aktif - pustaka potong setelah " + REDEMPTION_FRAMES
+            + " frame, kirim setelah sunyi " + SILENCE_SEC + " s");
       } else {
         var s = state;
         state = null;
-        if (s) {
-          try { s.vad.pause(); } catch (e) {}
-          try { if (s.vad.stream && s.vad.stream.getTracks) s.vad.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
-          try {
-            if (s.vad.audioNodeVAD && s.vad.audioNodeVAD.entryNode && s.vad.audioNodeVAD.entryNode.disconnect) {
-              s.vad.audioNodeVAD.entryNode.disconnect();
-            }
-          } catch (e) {}
-          try { if (s.vad.audioContext && s.vad.audioContext.close) s.vad.audioContext.close(); } catch (e) {}
+        var p = pending;
+        pending = null;
+        // PENTING: bereskan() menerima INSTANS MicVAD, bukan pembungkus
+        // { vad }. Melewatkan pembungkus membuat .stream tidak ketemu dan
+        // mikrofon tidak pernah dilepas (bug nyata, tertangkap uji).
+        if (s) bereskan(s.vad);
+        if (!s && p) {
+          // Init masih jalan; gen sudah dinaikkan sehingga hasilnya dibuang
+          // dan mikrofonnya dilepas begitu getUserMedia selesai.
+          log("Hentikan saat menyiapkan - mikrofon akan dilepas");
         }
+        segmen = [];
+        sunyiFrame = 0;
         setStatus("nonaktif");
         setInfo("mikrofon dilepas");
         log("nonaktif - mikrofon dilepas");
@@ -945,11 +1149,14 @@ VAD_BOOT_JS = """
     } catch (e) {
       console.error("[garuda-vad] gagal:", e);
       window.__GARUDA_VAD_ERROR__ = String(e);
+      pending = null;
+      segmen = [];
       setStatus("gagal: " + String(e));
       setInfo("gagal: " + String(e));
       return false;
     }
   };
+
   log("skrip dimuat (menunggu tombol Mulai)");
 })();
 </script>

@@ -157,8 +157,12 @@ tombol berkedip, threshold sunyi tidak bisa diatur, dan terasa masih manual.
 - Panel antrian dibaca dari DB, bukan dari state memori di `loop.py`.
 - `do_ingest_clip()` **wajib** menolak klip bila `_LISTENING` belum diset. Endpoint ini
   terbuka lewat HTTP; tanpa penjagaan itu siapa pun bisa memicu alert otomatis.
-  Ia juga **wajib** memvalidasi path (harus berkas nyata berekstensi audio) dan
-  memakai durasi kiriman browser bila ada, karena WAV dibuat di sisi klien.
+  Ia juga **wajib** memastikan berkas berada di folder unggahan Gradio
+  (`_berkas_unggahan_sah`), bukan path sembarang di disk. Tanpa batas folder ini,
+  siapa pun yang bisa menjangkau port aplikasi selagi mode menyala dapat memutar
+  ulang rekaman lama di disk dan memicu alert otomatis dari situ. Durasi kiriman
+  browser dipakai bila masuk akal; nilai karangan (di luar 0–600 s, atau jauh
+  melebihi isi berkas) jatuh kembali ke hasil probe.
 - Aset VAD diunduh **hanya** lewat `setup_models.py vad`, tidak pernah saat runtime.
   Tanpa aset, mode tetap menyala tapi tanpa deteksi otomatis; operator masih bisa
   memakai panel upload manual.
@@ -166,14 +170,22 @@ tombol berkedip, threshold sunyi tidak bisa diatur, dan terasa masih manual.
 **Perintah terkait:**
 ```powershell
 .\.venv\Scripts\python.exe setup_models.py vad        # unduh aset VAD (butuh internet, sekali)
-.\.venv\Scripts\python.exe test_live.py               # 29 pemeriksaan mode dengar terus
+.\.venv\Scripts\python.exe test_live.py               # 30 pemeriksaan mode dengar terus
 .\.venv\Scripts\python.exe test_ingest_endpoint.py    # 13 pemeriksaan protokol browser->server
+node test_vad_gerbang.js                              # 14 pemeriksaan gerbang sunyi (dipanggil test_live.py)
 ```
 
-`test_ingest_endpoint.py` menyalakan server Gradio sungguhan lalu meniru persis dua
-panggilan HTTP browser (upload + `call/ingest_clip`, termasuk pembacaan SSE). Uji ini
-yang membuktikan potongan audio benar-benar sampai ke antrian — tanpa itu, deteksi
-suara sebaik apa pun tidak akan pernah memproses apa pun.
+Dua uji ini menutup dua celah berbeda:
+
+- `test_ingest_endpoint.py` menyalakan server Gradio sungguhan lalu melakukan
+  panggilan HTTP yang sama dengan browser (upload → `call/ingest_clip` → baca SSE).
+  Ia membuktikan potongan audio benar-benar sampai ke antrian. Ia **tidak**
+  menjalankan kode browser, jadi tidak bisa menangkap regresi di `VAD_BOOT_JS`.
+- `test_vad_gerbang.js` menjalankan `VAD_BOOT_JS` hasil substitusi terhadap
+  `models/vad/vad-web.bundle.min.js` **asli**, dengan probabilitas bicara buatan.
+  Ini satu-satunya uji yang menangkap: desain lama (VAD mengklik tombol rekam),
+  sunyi yang menghasilkan klip, transmisi pendek yang hilang/tergabung salah,
+  dan mikrofon yang bocor saat Hentikan atau saat Mulai ditekan dua kali.
 
 **Hal-hal yang mudah dirusak saat mengubah `loop.py`:**
 - `stop_worker()` memakai `threading.Event` per-thread, **bukan** sentinel `None` di
@@ -204,14 +216,31 @@ suara sebaik apa pun tidak akan pernah memproses apa pun.
   (`silero_vad.onnx`, `vad.worklet.bundle.min.js`) dicari relatif ke `src` tag
   `<script>` vad-web, jadi keenam aset **harus** berada di `models/vad/`.
 - Hanya `ort.env.wasm.wasmPaths` yang bisa diarahkan manual.
-- **Sunyi 3 detik diatur lewat `redemptionFrames`, bukan konstanta detik.** Pustaka
-  memakai `frameSamples: 1536` pada 16 kHz, jadi satu frame = 0,096 s dan
-  `redemptionFrames` dihitung `round(SILENCE_SECONDS * 16000 / 1536)` = 31 frame
-  (2,98 s). Default pustaka hanya 8 frame (~0,77 s). Jangan ganti `frameSamples`
-  tanpa menghitung ulang; pustaka hanya menerima 512/1024/1536.
-- `onSpeechEnd(audio)` menerima **`Float32Array` 16 kHz**, bukan Blob/file. `keWav()`
-  yang mengubahnya jadi WAV 16-bit mono. `detik = audio.length / 16000` dikirim
-  bersama path supaya server tidak perlu memprobe ulang.
+- **Jangan atur "sunyi 3 detik" lewat `redemptionFrames`.** `redemptionFrames` adalah
+  *penduga akhir bicara*, dan pustaka memasukkan seluruh frame sunyi ke dalam
+  `audioBuffer` sebelum menutup segmen. Bila disetel 31 (≈3 s), aksiomatiknya jadi:
+  transmisi 0,5 s menghasilkan klip 3,5 s (sunyi mati menempel), dan dua transmisi
+  berjeda <3 s **digabung jadi satu klip raksasa** — sudah dibuktikan dengan bundle
+  asli. Pakai `REDEMPTION_FRAMES = 8` (≈0,77 s) supaya akhir bicara responsif,
+  lalu terapkan gerbang sunyi sendiri: `SILENCE_FRAMES` dihitung dari
+  `SILENCE_SECONDS / FRAME_SEC` (±31 frame) dan diuji di `onFrameProcessed`.
+  Segmen yang datang sebelum gerbang lepas digabung — itu memang yang diinginkan
+  (satu kalimat radio utuh).
+- `frameSamples: 1536` pada 16 kHz = 0,096 s per frame. Pustaka hanya menerima
+  512/1024/1536; jangan ganti tanpa menghitung ulang `FRAME_SEC`.
+- `onFrameProcessed(probs)` menerima objek `{notSpeech, isSpeech}`, dipanggil untuk
+  **setiap** frame (termasuk frame yang menutup segmen). Ini satu-satunya sumber
+  kebenaran soal sunyi — jangan pakai timer/jam dinding, karena hitungannya
+  meleset saat tab di latar atau thread sibuk.
+- `onSpeechEnd(audio)` menerima **`Float32Array` 16 kHz** yang ujungnya masih
+  mengandung ±8 frame sunyi. `lepasGerbang()` memangkas ekor itu sebelum
+  `keWav()` mengubahnya jadi WAV 16-bit mono.
+- `bereskan()` menerima **instans `MicVAD`**, bukan pembungkus `{vad}`. Memanggil
+  `bereskan(state)` membuat `.stream` tidak ketemu dan mikrofon tidak pernah
+  dilepas (bug nyata, tertangkap `test_vad_gerbang.js`).
+- Mulai/Hentikan memakai `pending` + `generasi`: klik ganda tidak membuka dua
+  stream mikrofon, dan Hentikan saat masih "menyiapkan" melepas mikrofon yang
+  terlanjur terbuka tanpa mengklaim "aktif".
 - VAD baru menyala setelah operator menekan **Mulai** (`js=` pada `click`),
   karena membuka mikrofon memerlukan izin eksplisit pengguna. `js=` mengembalikan
   `"status|info"` ke `vad_state`, lalu `vad_report()` menampilkannya ke `live_status`
@@ -219,19 +248,22 @@ suara sebaik apa pun tidak akan pernah memproses apa pun.
   `__GARUDA_VAD_INFO__` setiap 2 detik.
   **Jangan hapus jalur pelaporan ini** — tanpa itu operator melihat "AKTIF"
   padahal tidak ada suara yang pernah terdeteksi.
+- `kirim()` **wajib** membaca SSE hasil (`bacaHasil`). Tanpa itu, penolakan server
+  (mis. mode sudah nonaktif) tidak pernah terlihat dan UI berbohong "terkirim".
 - Saat Hentikan, ambil `v.stream` untuk `getTracks().stop()`.
   `v.listening` adalah **boolean**, bukan MediaStream — memakainya membuat
   mikrofon tidak pernah dilepas (bug nyata yang pernah terjadi).
 - `ort-wasm-simd.wasm` ikut diunduh sebagai cadangan untuk halaman tanpa
   cross-origin isolation (tanpa `SharedArrayBuffer`).
 
-**Belum terverifikasi:** deteksi suara sungguhan di browser (butuh mic manusia) dan
-apakah `redemptionFrames: 31` memotong transmisi pada jeda bicara normal — jeda
-napas >3 s akan memecah satu kalimat jadi dua klip. Yang sudah terbukti: rantai
-`ort.min.js` → `vad-web.bundle.min.js` menghasilkan `window.vad.MicVAD` berupa
-fungsi, keenam aset HTTP 200, substitusi skrip benar, `audio_in` hanya `upload`,
-nol handler `stop_recording`, dan protokol browser→antrian lulus 13/13
-(`test_ingest_endpoint.py`).
+**Belum terverifikasi:** deteksi suara sungguhan dengan mikrofon manusia di browser
+nyata — termasuk apakah ambang bawaan Silero (0,5/0,35) cukup untuk radio yang
+berderau. Yang sudah terbukti dengan bundle asli: sunyi tidak menghasilkan klip,
+transmisi pendek tidak hilang, jeda pendek digabung, jeda ≥3 s memisah klip,
+mikrofon dilepas saat Hentikan, dan klik ganda tidak membuka dua stream.
+Rantai `ort.min.js` → `vad-web.bundle.min.js` menghasilkan `window.vad.MicVAD`
+berupa fungsi, keenam aset HTTP 200, substitusi skrip benar, `audio_in` hanya
+`upload`, nol handler `stop_recording`, dan protokol browser→antrian lulus 13/13.
 
 ---
 
