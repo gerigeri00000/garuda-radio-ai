@@ -401,9 +401,46 @@ def add_ticket(**kw) -> int:
         return cur.lastrowid  # type: ignore[return-value]
 
 
-def list_tickets(limit: int = 200) -> list[dict]:
+def list_tickets(limit: int = 200, statuses: list[str] | None = None,
+                 priorities: list[str] | None = None, kind: str | None = None,
+                 date_from: str | None = None, date_to: str | None = None) -> list[dict]:
+    """Daftar tiket dengan filter.
+
+    Filter dikerjakan di SQL, bukan disaring di Python setelah semua baris
+    diambil: kalau disaring belakangan, `limit` membatasi baris SEBELUM
+    filter sehingga tiket yang cocok bisa hilang dari hasil.
+    """
+    sql = "SELECT * FROM tickets WHERE 1=1"
+    args: list[Any] = []
+    if statuses:
+        sql += f" AND status IN ({','.join('?' * len(statuses))})"
+        args.extend(statuses)
+    if priorities:
+        sql += f" AND priority IN ({','.join('?' * len(priorities))})"
+        args.extend(priorities)
+    if kind and kind != "Semua":
+        sql += " AND kind=?"
+        args.append(kind)
+    if date_from:
+        sql += " AND date(created_at) >= date(?)"
+        args.append(date_from)
+    if date_to:
+        sql += " AND date(created_at) <= date(?)"
+        args.append(date_to)
+    sql += " ORDER BY id DESC LIMIT ?"
+    args.append(limit)
     with connect() as conn:
-        return _rows(conn.execute("SELECT * FROM tickets ORDER BY id DESC LIMIT ?", (limit,)).fetchall())
+        return _rows(conn.execute(sql, args).fetchall())
+
+
+def ticket_kinds() -> list[str]:
+    """Jenis tiket yang benar-benar ada di database (untuk isi dropdown)."""
+    with connect() as conn:
+        baris = conn.execute(
+            "SELECT DISTINCT kind FROM tickets WHERE kind IS NOT NULL AND kind<>'' ORDER BY kind"
+        ).fetchall()
+    return [r[0] for r in baris]
+
 
 
 def get_ticket(ticket_id: int) -> dict | None:
@@ -422,6 +459,25 @@ def open_tickets() -> list[dict]:
     with connect() as conn:
         return _rows(conn.execute(
             "SELECT * FROM tickets WHERE status NOT IN ('Completed','Rejected') ORDER BY id").fetchall())
+
+
+def delete_ticket(ticket_id: int, actor: str = "operator") -> bool:
+    """Hapus PERMANEN satu tiket, hanya bila statusnya `Rejected`.
+
+    Penjagaan status ada di sini, bukan hanya di UI, supaya pemanggil lain
+    tidak bisa menghapus tiket yang masih berjalan (Pending/Approved) atau
+    yang sudah selesai. Tiket yang masih berjalan harus di-decline dulu -
+    itu jejak audit untuk keputusan operator.
+    """
+    t = get_ticket(ticket_id)
+    if not t or t["status"] != "Rejected":
+        return False
+    with _LOCK, connect() as conn:
+        conn.execute("DELETE FROM tickets WHERE id=? AND status='Rejected'", (ticket_id,))
+        conn.commit()
+    log("ticket", ticket_id, "deleted", {"status": "Rejected"}, actor)
+    return True
+
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +502,11 @@ def add_alert(**kw) -> int:
 def list_alerts(limit: int = 100) -> list[dict]:
     with connect() as conn:
         return _rows(conn.execute("SELECT * FROM alerts ORDER BY id DESC LIMIT ?", (limit,)).fetchall())
+
+
+def get_alert(alert_id: int) -> dict | None:
+    with connect() as conn:
+        return _row(conn.execute("SELECT * FROM alerts WHERE id=?", (alert_id,)).fetchone())
 
 
 def update_alert_status(alert_id: int, status: str) -> None:

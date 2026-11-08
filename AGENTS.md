@@ -10,7 +10,7 @@
 
 **GARUDA Radio AI** — app desktop lokal & offline: audio radio → **faster-whisper**
 (transkripsi ID) → **Qwen2.5 1.5B/3B GGUF via llama.cpp** → JSON terstruktur →
-**validasi Python** → aksi otomatis ke SQLite → UI Gradio (6 tab).
+**validasi Python** → aksi otomatis ke SQLite → UI Gradio (5 tab).
 
 **Batasan yang tidak boleh dilanggar (aturan produk, bukan preferensi):**
 - Semua lokasi/unit/skenario = **DEMO DATA** (fiktif). Jangan tambah data dunia nyata.
@@ -35,7 +35,7 @@
 | `loop.py` | antrian klip mode dengar-terus + thread pekerja; tulis transisi ke `events_log` | ubah antrian/ingest |
 | `map_view.py` | Folium + fallback SVG offline | ubah peta |
 | `reports.py` | rekap + ekspor CSV/PDF | ubah rekap |
-| `app.py` | UI Gradio satu halaman `build_ui()` (6 tab), handler `do_*`, `_refresh_all()` | ubah UI |
+| `app.py` | UI Gradio satu halaman `build_ui()` (5 tab), handler `do_*`, `_refresh_all()` | ubah UI |
 | `setup_models.py` | unduh & cek model (`status`, `whisper-small`, `llm-3b`, `tts-id`) | ubah model |
 | `samples_gen.py` | generator audio TTS Piper offline + data demo | ubah sampel |
 | `test_scenarios.py` | 47 pemeriksaan end-to-end (audio TTS nyata, reset DB) | verifikasi |
@@ -129,6 +129,43 @@ bila hanya membaca kode — katakan terus terang bahwa belum dijalankan.
 - `llama-cpp-python` build CPU saat pengujian → analisis 3B ±15–20 s. Jangan "optimalkan"
   dengan pindah ke API cloud.
 - Jangan menambah dependensi berat tanpa memperbarui `requirements.txt` + langkah `setup.bat`.
+
+### 7a. UI: pilih baris, bukan ketik ID
+
+Struktur tab final (**5**): `🎙 Monitor` · `✅ Tiket` · `🗺 Peta` · `📑 Rekap` · `⚙ Pengaturan`.
+
+Dua tab lama sudah dihapus dan digabung: **Dashboard** (KPI + banner "persetujuan
+operator" pindah ke atas tab Monitor) dan **Riwayat & Tiket** (riwayat laporan +
+peringatan pindah ke tab Tiket).
+
+**Tidak ada lagi kotak "ketik ID".** Semua aksi pada tiket, pembaruan peta, dan
+peringatan bekerja lewat **klik baris**:
+
+```python
+df.select(saat_baris_tiket_diklik, None, [ringkas_pilih, tiket_dipilih,
+                                          btn_approve, btn_decline, btn_hapus])
+```
+
+- `evt.row_value` berisi **seluruh isi baris** (terverifikasi di Gradio 6.31):
+  contoh `[22, 'LOGISTICS', 'air', 'Approved']`. Ambil ID lewat indeks kolom
+  (`_ID_IX`), lalu `db.get_ticket(id)` untuk data segar.
+- Baris terpilih disimpan di `gr.State(int | None)` (`tiket_dipilih`,
+  `map_upd_id`, `alert_dipilih`); aksi memakai state itu sebagai input.
+- `_tombol_untuk(status)` mengembalikan `gr.update(visible=...)` supaya **hanya
+  tombol yang berlaku** yang tampil: Approve hanya untuk `Pending`, Decline untuk
+  `Pending`/`Approved`, **Hapus hanya untuk `Rejected`**.
+- Setiap aksi mengosongkan kembali pilihan (`_setelah_aksi`, `do_filter_tiket`,
+  `do_reset_filter_tiket`) agar tombol tidak mengenai baris yang statusnya sudah
+  berubah.
+- Hapus permanen = konfirmasi **dua langkah di server** lewat `_HAPUS_ARM`
+  (klik 1 minta konfirmasi, klik 2 dengan ID sama baru menghapus). Jangan ganti
+  dengan `confirm()` browser.
+
+**Aturan uji browser (penting):** isi `gr.Dataframe` **tidak boleh** dibaca dengan
+scraping `<tbody>`/teks baris — tabel Gradio memakai grid virtual, sehingga
+`<tbody>` sering hanya berisi satu baris kosong atau baris yang belum ter-render.
+Klik/verifikasi harus menyasar `td` / `[role='gridcell']` yang berisi teks, dan
+**dibatasi ke tab aktif** (`:visible`) karena sel di tab tersembunyi tidak bisa diklik.
 
 ---
 

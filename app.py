@@ -207,6 +207,7 @@ def raw_json(res: dict) -> str:
 # Proses utama audio
 # ---------------------------------------------------------------------------
 def _refresh_all():
+    """Semua panel yang menampilkan data dari database."""
     return (dashboard_html(), approval_html(), map_view.build_map(),
             _tickets_table(), _reports_table(), _map_pending_table(), _alerts_table())
 
@@ -459,11 +460,25 @@ ALERT_COLS = ["ID", "Kategori", "Prioritas", "Pesan", "Lokasi", "Status", "Dibua
 REPORT_COLS = ["ID", "Waktu", "Kategori", "Unit", "Ringkasan", "Item", "Lokasi", "Prioritas",
                "Aksi", "Keyakinan", "Verifikasi", "Status"]
 MAP_COLS = ["ID", "Lokasi", "Status Baru", "Catatan", "Persetujuan", "Dibuat"]
+_ID_IX = TICKET_COLS.index("ID")
+
+PETUNJUK_PILIH = "👉 **Klik satu baris pada tabel** untuk melihat aksi yang tersedia."
+PETUNJUK_ALERT = "👉 **Klik satu baris peringatan** untuk menandainya."
+
+
+def _ticket_rows(statuses=None, priorities=None, kind="Semua",
+                 date_from=None, date_to=None):
+    """Baris tabel tiket (hanya-baca)."""
+    return [[t["id"], t["kind"], t["item"], t["quantity"], t["unit_measure"],
+             t["requester"], t["priority"], t["status"], t["created_at"][:16]]
+            for t in db.list_tickets(
+                200, statuses=statuses, priorities=priorities, kind=kind,
+                date_from=_d(date_from), date_to=_d(date_to))]
 
 
 def _tickets_table():
-    return [[t["id"], t["kind"], t["item"], t["quantity"], t["unit_measure"], t["requester"],
-             t["priority"], t["status"], t["created_at"][:16]] for t in db.list_tickets(200)]
+    return _ticket_rows()
+
 
 
 def _alerts_table():
@@ -497,40 +512,164 @@ def _d(val):
 
 # ---------------------------------------------------------------------------
 # Aksi operator
+#
+# Semua aksi bekerja pada baris yang DIKLIK, bukan ID yang diketik.
+# `gr.Dataframe.select` memberi `evt.row_value` = seluruh isi baris, jadi ID
+# dan statusnya terbaca tanpa menebak dari teks layar.
 # ---------------------------------------------------------------------------
-def do_approve_ticket(tid):
-    if tid in (None, ""):
-        return "⚠ Isi ID tiket.", *_refresh_all()
-    r = actions.approve_ticket(int(tid))
-    return ("✅ " if r["ok"] else "❌ ") + r["message"], *_refresh_all()
+def _filter_status():
+    return gr.CheckboxGroup(choices=db.TICKET_STATUSES, value=list(db.TICKET_STATUSES),
+                            label="Status", scale=3)
 
 
-def do_set_ticket_status(tid, status):
-    if tid in (None, ""):
-        return "⚠ Isi ID tiket.", *_refresh_all()
-    r = actions.set_ticket_status(int(tid), status)
-    return ("✅ " if r["ok"] else "❌ ") + r["message"], *_refresh_all()
+def _filter_prioritas():
+    return gr.CheckboxGroup(choices=["HIGH", "MEDIUM", "LOW"],
+                            value=["HIGH", "MEDIUM", "LOW"], label="Prioritas", scale=2)
 
 
-def do_apply_status(rid, tid, status):
-    if rid in (None, "") or tid in (None, ""):
-        return "⚠ Isi ID laporan & tiket.", *_refresh_all()
-    r = actions.apply_status_update(int(rid), int(tid), status)
-    return ("✅ " if r["ok"] else "❌ ") + r["message"], *_refresh_all()
+def _jenis_tiket():
+    """Pilihan jenis tiket: yang ada di DB, atau daftar baku bila DB kosong."""
+    jenis = db.ticket_kinds()
+    return ["Semua"] + (jenis or ["LOGISTICS", "MEDICAL", "EQUIPMENT", "INFRASTRUCTURE"])
+
+
+def _baris_terpilih(evt, kolom_id=0):
+    baris = getattr(evt, "row_value", None)
+    if not baris:
+        return None
+    try:
+        return int(baris[kolom_id])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _tombol_untuk(status):
+    """(approve, decline, hapus) - tampil hanya yang BERLAKU untuk status itu."""
+    return (gr.update(visible=status == "Pending"),
+            gr.update(visible=status in ("Pending", "Approved")),
+            gr.update(visible=status == "Rejected"))
+
+
+def saat_baris_tiket_diklik(evt: gr.SelectData):
+    """Klik baris: simpan pilihan, tampilkan ringkasan + tombol yang berlaku."""
+    tid = _baris_terpilih(evt, _ID_IX)
+    t = db.get_ticket(tid) if tid else None
+    if not t:
+        return PETUNJUK_PILIH, None, *_tombol_untuk(None)
+    jumlah = f"{t['quantity'] or ''} {t['unit_measure'] or ''}".strip()
+    ringkas = (f"**Dipilih: Tiket #{t['id']}** — {t['kind'] or '-'}: {t['item'] or '-'} "
+               f"{jumlah} · pelapor {t['requester'] or '-'} · prioritas "
+               f"{t['priority'] or '-'} · status **{t['status']}**")
+    return ringkas, t["id"], *_tombol_untuk(t["status"])
+
+
+def do_filter_tiket(statuses, priorities, kind, date_from, date_to):
+    rows = _ticket_rows(statuses, priorities, kind, date_from, date_to)
+    return (rows, PETUNJUK_PILIH, None, *_tombol_untuk(None),
+            f"Menampilkan **{len(rows)}** tiket.")
+
+
+def do_reset_filter_tiket():
+    rows = _ticket_rows()
+    return (list(db.TICKET_STATUSES), ["HIGH", "MEDIUM", "LOW"], "Semua",
+            None, None, rows, PETUNJUK_PILIH, None, *_tombol_untuk(None),
+            f"Filter direset. Menampilkan **{len(rows)}** tiket.")
+
+
+def _pesan(hasil: dict, label: str) -> str:
+    return f"{'✅' if hasil['ok'] else '⚠'} {label}: {hasil['message']}"
+
+
+def _setelah_aksi(hasil: dict, label: str):
+    """Pesan + tabel segar + pilihan dikosongkan (tombol disembunyikan lagi).
+
+    Pilihan sengaja dikosongkan: setelah bertindak, status baris itu sudah
+    berubah, jadi membiarkannya "terpilih" akan menampilkan tombol yang salah.
+    """
+    return (_pesan(hasil, label), _ticket_rows(), PETUNJUK_PILIH, None,
+            *_tombol_untuk(None))
+
+
+def do_approve_tiket(tid):
+    if not tid:
+        return _setelah_aksi({"ok": False, "message": "Klik satu baris dulu."}, "Setujui")
+    return _setelah_aksi(actions.approve_ticket(int(tid)), "Setujui")
+
+
+def do_decline_tiket(tid):
+    if not tid:
+        return _setelah_aksi({"ok": False, "message": "Klik satu baris dulu."}, "Tolak")
+    return _setelah_aksi(actions.reject_ticket(int(tid)), "Tolak")
+
+
+# Hapus permanen butuh konfirmasi. ID yang sudah "dipersenjatai" pada klik
+# pertama; klik kedua untuk ID yang SAMA baru benar-benar menghapus.
+_HAPUS_ARM = {"ids": []}
+
+
+def do_hapus_tiket(tid):
+    """Klik pertama = konfirmasi, klik kedua (ID sama) = hapus permanen."""
+    if not tid:
+        _HAPUS_ARM["ids"] = []
+        return _setelah_aksi({"ok": False, "message": "Klik satu baris dulu."}, "Hapus")
+    tid = int(tid)
+    if _HAPUS_ARM["ids"] != [tid]:
+        _HAPUS_ARM["ids"] = [tid]
+        return (f"⚠️ **Konfirmasi hapus permanen tiket #{tid}.** "
+                "Data yang terhapus tidak bisa dikembalikan. "
+                "Tekan **🗑 Hapus permanen** sekali lagi untuk melanjutkan.",
+                gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip())
+    _HAPUS_ARM["ids"] = []
+    ok = db.delete_ticket(tid)
+    hasil = ({"ok": True, "message": f"Tiket #{tid} dihapus permanen."} if ok
+             else {"ok": False, "message": f"Tiket #{tid} tidak bisa dihapus "
+                                           "(hanya tiket berstatus Rejected)."})
+    return _setelah_aksi(hasil, "Hapus")
+
+
+def saat_baris_alert_diklik(evt: gr.SelectData):
+    aid = _baris_terpilih(evt)
+    a = db.get_alert(aid) if aid else None
+    if not a:
+        return (PETUNJUK_ALERT, None,
+                gr.update(visible=False), gr.update(visible=False))
+    ringkas = (f"**Dipilih: Peringatan #{a['id']}** — {a['priority']} · "
+               f"{a['message']} · status **{a['status']}**")
+    return (ringkas, a["id"],
+            gr.update(visible=a["status"] != "Acknowledged"),
+            gr.update(visible=a["status"] != "Resolved"))
+
+
+def do_tandai_alert(aid, status):
+    if not aid:
+        return ("⚠ Klik satu baris dulu.", _alerts_table(), PETUNJUK_ALERT, None,
+                gr.update(visible=False), gr.update(visible=False))
+    r = actions.acknowledge_alert(int(aid), status)
+    return (_pesan(r, "Peringatan"), _alerts_table(), PETUNJUK_ALERT, None,
+            gr.update(visible=False), gr.update(visible=False))
+
+
+def saat_baris_peta_diklik(evt: gr.SelectData):
+    uid = _baris_terpilih(evt)
+    u = db.get_map_update(uid) if uid else None
+    if not u:
+        return ("👉 **Klik satu baris pembaruan peta** untuk memilihnya.", None,
+                gr.update(visible=False), gr.update(visible=False))
+    ringkas = (f"**Dipilih: Pembaruan #{u['id']}** — {u['location_name'] or u['location_key']} "
+               f"→ {u['new_status']} · status **{u['status']}**")
+    berlaku = u["status"] == "Pending Approval"
+    return (ringkas, u["id"], gr.update(visible=berlaku), gr.update(visible=berlaku))
 
 
 def do_map_decision(uid, approve):
-    if uid in (None, ""):
-        return "⚠ Isi ID pembaruan peta.", *_refresh_all()
+    """Setujui/tolak pembaruan peta untuk ID yang dipilih lewat klik baris."""
+    kosong = ("👉 **Klik satu baris pembaruan peta** untuk memilihnya.", None,
+              gr.update(visible=False), gr.update(visible=False))
+    if not uid:
+        return ("⚠ Klik satu baris dulu.", _map_pending_table(), *kosong)
     r = (actions.approve_map_update if approve else actions.reject_map_update)(int(uid))
-    return ("✅ " if r["ok"] else "❌ ") + r["message"], *_refresh_all()
+    return (_pesan(r, "Peta"), _map_pending_table(), *kosong)
 
-
-def do_alert_status(aid, status):
-    if aid in (None, ""):
-        return "⚠ Isi ID alert.", *_refresh_all()
-    r = actions.acknowledge_alert(int(aid), status)
-    return ("✅ " if r["ok"] else "❌ ") + r["message"], *_refresh_all()
 
 
 def do_recap(date_from, date_to, category):
@@ -616,16 +755,15 @@ def build_ui() -> gr.Blocks:
 
 
         with gr.Tabs():
-            # ---------------- Tab 1: Monitor & Analisis ----------------
-            with gr.Tab("🎙 Monitor & Analisis"):
-                gr.Markdown("### Mode dengar terus")
-                gr.Markdown("<span class='muted'>Tekan <b>Mulai</b> sekali. Mikrofon akan "
-                            "streaming terus; setiap transmisi dipotong otomatis setelah "
-                            f"sunyi {config.SILENCE_SECONDS:.0f} detik dan langsung diproses. "
-                            "Tidak perlu menekan tombol apa pun lagi.</span>")
+            # ---------------- Tab 1: Monitor (KPI + dengar terus + antrian) ----
+            with gr.Tab("🎙 Monitor"):
+                dashboard_box = gr.HTML(dashboard_html())
+                approval_box = gr.HTML(approval_html())
+                gr.Markdown("---")
+                gr.Markdown("### 🎙 Dengar terus")
                 with gr.Row():
                     btn_listen_on = gr.Button("🟢 Mulai dengar terus", variant="primary",
-                                              scale=1)
+                                              scale=2)
                     btn_listen_off = gr.Button("⏹ Hentikan", scale=1)
                 live_status = gr.Markdown("Status: **nonaktif**.", elem_id="live_status")
                 # Satu kotak tersembunyi berisi "status|info" dari skrip VAD.
@@ -639,17 +777,12 @@ def build_ui() -> gr.Blocks:
                                             label="durasi potongan (detik)")
                 btn_ingest_hidden = gr.Button(visible=False)
 
-                gr.Markdown("#### Antrian transmisi")
+                gr.Markdown("### 📡 Antrian transmisi")
                 live_df = gr.Dataframe(headers=LIVE_COLS, value=live_queue_table(),
                                        interactive=False, wrap=True,
                                        elem_id="live_queue")
-                gr.Markdown("<span class='muted'>Terbaca dari database, memperbarui diri "
-                            "setiap 2 detik. Transmisi tetap diproses walau panel ditutup.</span>")
 
                 with gr.Accordion("📁 Proses file manual (upload audio lama)", open=False):
-                    gr.Markdown("<span class='muted'>Terpisah dari mode dengar terus. "
-                                "Dipakai hanya bila Anda punya file rekaman yang mau "
-                                "diproses sekali jalan.</span>")
                     with gr.Row():
                         with gr.Column(scale=5):
                             audio_in = gr.Audio(sources=["upload"], type="filepath",
@@ -677,81 +810,97 @@ def build_ui() -> gr.Blocks:
                         txt_in = gr.Textbox(label="Teks laporan",
                                             placeholder="Contoh: Pos Bravo membutuhkan tambahan 30 liter solar.")
                         btn_text = gr.Button("Proses teks", size="sm")
-                    with gr.Accordion("Konfigurasi model (lokal)", open=False):
-                        gr.HTML(settings_status(), elem_id="cfg_status_small")
+                    with gr.Accordion("Demo & uji 6 skenario", open=False):
+                        with gr.Row():
+                            btn_samples = gr.Button("🎧 Buat contoh audio", size="sm")
+                            btn_test_all = gr.Button("▶ Uji 6 skenario", variant="secondary",
+                                                     size="sm")
+                        btn_refresh_main = gr.Button("🔄 Muat ulang data", size="sm")
+                        sample_msg = gr.Markdown("")
+                        demo_result = gr.HTML("")
 
                 outputs_common = []  # didefinisikan setelah komponen dibuat di bawah
 
-                gr.Markdown("### Demo: 6 skenario simulasi")
-                with gr.Row():
-                    btn_samples = gr.Button("🎧 Buat contoh audio (TTS lokal)", size="sm")
-                    btn_test_all = gr.Button("▶ Uji semua 6 skenario", variant="secondary", size="sm")
-                    btn_refresh_main = gr.Button("🔄 Refresh data", size="sm")
-                sample_msg = gr.Markdown("")
-                demo_result = gr.HTML("")
+            # ---------------- Tab 2: Tiket (approval + riwayat + peringatan) ----
+            with gr.Tab("✅ Tiket"):
+                gr.Markdown("### Tindak lanjut tiket")
+                gr.Markdown("<span class='muted'>Klik satu baris untuk melihat aksi "
+                            "yang tersedia untuk tiket itu.</span>")
 
-            # ---------------- Tab 2: Dashboard ----------------
-            with gr.Tab("📊 Dashboard"):
-                dashboard_box = gr.HTML(dashboard_html())
-                with gr.Row():
-                    btn_dash_refresh = gr.Button("🔄 Refresh", size="sm")
-                with gr.Row():
-                    btn_seed = gr.Button("Isi data demo (hanya bila database kosong)", size="sm")
-                seed_msg = gr.Markdown("")
-                gr.Markdown("### Persetujuan operator")
-                approval_box = gr.HTML(approval_html())
+                with gr.Accordion("🔎 Filter", open=False):
+                    with gr.Row():
+                        f_status = _filter_status()
+                        f_prioritas = _filter_prioritas()
+                    with gr.Row():
+                        f_jenis = gr.Dropdown(_jenis_tiket(), value="Semua",
+                                              label="Jenis", scale=1)
+                        f_dari = gr.DateTime(label="Dari tanggal", include_time=False, scale=1)
+                        f_sampai = gr.DateTime(label="Sampai tanggal", include_time=False,
+                                               scale=1)
+                    with gr.Row():
+                        btn_terapkan_filter = gr.Button("🔎 Terapkan filter",
+                                                        variant="secondary", size="sm")
+                        btn_reset_filter = gr.Button("↺ Reset filter", size="sm")
+                        btn_approval_refresh = gr.Button("🔄 Muat ulang", size="sm")
+                filter_info = gr.Markdown(f"Menampilkan **{len(_ticket_rows())}** tiket.")
 
-            # ---------------- Tab 3: Riwayat & Tiket ----------------
-            with gr.Tab("🗂 Riwayat & Tiket"):
-                gr.Markdown("### Persetujuan & perubahan status")
+                tickets_df = gr.Dataframe(headers=TICKET_COLS, value=_ticket_rows(),
+                                          interactive=False, wrap=True,
+                                          label="Klik satu baris untuk memilih")
+
+                tiket_dipilih = gr.State(None)
+                approval_msg = gr.Markdown("")
+                ringkas_pilih = gr.Markdown(PETUNJUK_PILIH)
+
+                # Tombol aman & berbahaya dipisah, dan hanya muncul bila berlaku.
+                btn_approve = gr.Button("✅ Approve tiket", variant="primary", visible=False)
                 with gr.Row():
-                    ticket_id = gr.Number(label="ID Tiket", precision=0, scale=1)
-                    btn_approve = gr.Button("✅ Setujui tiket (Pending → Approved)", variant="primary", scale=2)
-                    ticket_status = gr.Dropdown(db.TICKET_STATUSES, value="In Progress", label="Ubah status", scale=1)
-                    btn_ticket_set = gr.Button("Terapkan status", scale=1)
+                    btn_decline = gr.Button("🚫 Decline (Rejected)", variant="stop",
+                                            visible=False)
+                    btn_hapus = gr.Button("🗑 Hapus permanen", variant="stop", visible=False)
+
+                gr.Markdown("---")
+                gr.Markdown("### 📋 Riwayat laporan")
                 with gr.Row():
-                    status_report_id = gr.Number(label="ID Laporan (UPDATE_STATUS)", precision=0, scale=1)
-                    status_ticket_id = gr.Number(label="ID Tiket terkait", precision=0, scale=1)
-                    status_new = gr.Dropdown(db.TICKET_STATUSES, value="Completed", label="Status baru", scale=1)
-                    btn_apply_status = gr.Button("Terapkan pembaruan status", scale=2)
-                ticket_msg = gr.Markdown("")
-                gr.Markdown("### Tiket")
-                tickets_df = gr.Dataframe(headers=TICKET_COLS, value=_tickets_table(),
-                                          interactive=False, wrap=True)
-                gr.Markdown("### Riwayat laporan")
-                with gr.Row():
-                    hist_cat = gr.Dropdown(["Semua"] + ai.CATEGORIES, value="Semua", label="Kategori",
-                                           scale=1)
+                    hist_cat = gr.Dropdown(["Semua"] + ai.CATEGORIES, value="Semua",
+                                           label="Kategori", scale=1)
                     hist_from = gr.DateTime(label="Dari tanggal", include_time=False, scale=1)
                     hist_to = gr.DateTime(label="Sampai tanggal", include_time=False, scale=1)
-                    btn_hist = gr.Button("Filter", size="sm", scale=1)
-                reports_df_on_history = gr.Dataframe(headers=REPORT_COLS, value=_reports_table(),
+                    btn_hist = gr.Button("🔎 Filter", size="sm", scale=1)
+                reports_df_on_history = gr.Dataframe(headers=REPORT_COLS,
+                                                     value=_reports_table(),
                                                      interactive=False, wrap=True)
-                gr.Markdown("### Peringatan")
-                with gr.Row():
-                    alert_id = gr.Number(label="ID Alert", precision=0, scale=1)
-                    alert_status = gr.Dropdown(db.ALERT_STATUSES, value="Acknowledged",
-                                               label="Status alert", scale=1)
-                    btn_alert = gr.Button("Ubah status alert", scale=1)
-                alert_msg = gr.Markdown("")
-                alerts_df = gr.Dataframe(headers=ALERT_COLS, value=_alerts_table(),
-                                         interactive=False, wrap=True)
 
-            # ---------------- Tab 4: Peta ----------------
-            with gr.Tab("🗺 Peta (DEMO DATA)"):
-                gr.Markdown("Marker memakai lokasi simulasi. Pembaruan status lokasi "
-                            "**wajib disetujui operator**.")
+                gr.Markdown("### 🔔 Peringatan")
+                alerts_df = gr.Dataframe(headers=ALERT_COLS, value=_alerts_table(),
+                                         interactive=False, wrap=True,
+                                         label="Klik satu baris untuk menandainya")
+                alert_dipilih = gr.State(None)
+                alert_msg = gr.Markdown("")
+                ringkas_alert = gr.Markdown(PETUNJUK_ALERT)
                 with gr.Row():
-                    btn_map_refresh = gr.Button("🔄 Refresh peta", size="sm")
+                    btn_alert_ack = gr.Button("👁 Tandai dibaca", visible=False)
+                    btn_alert_resolve = gr.Button("✔ Tandai selesai", variant="primary",
+                                                  visible=False)
+
+            # ---------------- Tab 3: Peta ----------------
+            with gr.Tab("🗺 Peta"):
+                gr.Markdown("### Peta status lokasi")
                 map_box = gr.HTML(map_view.build_map(), elem_id="map_html")
-                gr.Markdown("### Pembaruan peta")
-                map_df = gr.Dataframe(headers=MAP_COLS, value=_map_pending_table(),
-                                      interactive=False, wrap=True)
+                gr.Markdown("### 📍 Pembaruan peta menunggu persetujuan")
+                gr.Markdown("<span class='muted'>Klik satu baris untuk menyetujui "
+                            "atau menolak pembaruan itu.</span>")
                 with gr.Row():
-                    map_upd_id = gr.Number(label="ID Pembaruan Peta", precision=0, scale=1)
-                    btn_map_approve = gr.Button("✅ Setujui", variant="primary", scale=1)
-                    btn_map_reject = gr.Button("✖ Tolak", scale=1)
+                    btn_map_refresh = gr.Button("🔄 Muat ulang peta", size="sm")
+                map_df = gr.Dataframe(headers=MAP_COLS, value=_map_pending_table(),
+                                      interactive=False, wrap=True,
+                                      label="Klik satu baris untuk memilih")
+                map_upd_id = gr.State(None)
                 map_msg = gr.Markdown("")
+                ringkas_map = gr.Markdown("👉 **Klik satu baris pembaruan peta** untuk memilihnya.")
+                with gr.Row():
+                    btn_map_approve = gr.Button("✅ Setujui", variant="primary", visible=False)
+                    btn_map_reject = gr.Button("✖ Tolak", variant="stop", visible=False)
 
             # ---------------- Tab 5: Rekap ----------------
             with gr.Tab("📑 Rekap"):
@@ -793,9 +942,13 @@ def build_ui() -> gr.Blocks:
             # ---------------- wiring ----------------
             all_outputs = [dashboard_box, approval_box, map_box, tickets_df,
                            reports_df_on_history, map_df, alerts_df]
-
-            def refresh():
-                return _refresh_all()
+            # Output setelah aksi tiket: pesan, tabel, ringkasan, pilihan, 3 tombol
+            out_tiket = [approval_msg, tickets_df, ringkas_pilih, tiket_dipilih,
+                         btn_approve, btn_decline, btn_hapus]
+            out_map = [map_msg, map_df, ringkas_map, map_upd_id,
+                       btn_map_approve, btn_map_reject]
+            out_alert = [alert_msg, alerts_df, ringkas_alert, alert_dipilih,
+                         btn_alert_ack, btn_alert_resolve]
 
             btn_process.click(process_audio_fn, [audio_in],
                               [transcript_box, analysis_box, json_box, status_box, *all_outputs])
@@ -835,23 +988,47 @@ def build_ui() -> gr.Blocks:
                                     concurrency_id="garuda_ingest")
             live_timer = gr.Timer(2.0, active=True)
             live_timer.tick(live_queue_table, None, live_df)
-            btn_dash_refresh.click(_refresh_all, None, all_outputs)
-            btn_seed.click(_seed_wrapper, None, [seed_msg, *all_outputs])
             btn_samples.click(generate_samples_fn, None, sample_msg)
             btn_test_all.click(process_samples_fn, None, [demo_result, *all_outputs])
-            btn_approve.click(do_approve_ticket, [ticket_id], [ticket_msg, *all_outputs])
-            btn_ticket_set.click(do_set_ticket_status, [ticket_id, ticket_status],
-                                 [ticket_msg, *all_outputs])
-            btn_apply_status.click(do_apply_status, [status_report_id, status_ticket_id, status_new],
-                                   [ticket_msg, *all_outputs])
-            btn_alert.click(do_alert_status, [alert_id, alert_status], [alert_msg, *all_outputs])
-            btn_hist.click(lambda f, t, c: _reports_table(f, t, c), [hist_from, hist_to, hist_cat],
-                           reports_df_on_history)
+
+            # ---- Tab Tiket: klik baris -> aksi sesuai status ----
+            tickets_df.select(saat_baris_tiket_diklik, None,
+                              [ringkas_pilih, tiket_dipilih,
+                               btn_approve, btn_decline, btn_hapus])
+            btn_approve.click(do_approve_tiket, [tiket_dipilih], out_tiket)
+            btn_decline.click(do_decline_tiket, [tiket_dipilih], out_tiket)
+            btn_hapus.click(do_hapus_tiket, [tiket_dipilih], out_tiket)
+            btn_terapkan_filter.click(do_filter_tiket,
+                                      [f_status, f_prioritas, f_jenis, f_dari, f_sampai],
+                                      [tickets_df, ringkas_pilih, tiket_dipilih,
+                                       btn_approve, btn_decline, btn_hapus, filter_info])
+            btn_reset_filter.click(do_reset_filter_tiket, None,
+                                   [f_status, f_prioritas, f_jenis, f_dari, f_sampai,
+                                    tickets_df, ringkas_pilih, tiket_dipilih,
+                                    btn_approve, btn_decline, btn_hapus, filter_info])
+            btn_approval_refresh.click(
+                lambda: (_ticket_rows(), PETUNJUK_PILIH, None, *_tombol_untuk(None),
+                         f"Menampilkan **{len(_ticket_rows())}** tiket."),
+                None, [tickets_df, ringkas_pilih, tiket_dipilih,
+                       btn_approve, btn_decline, btn_hapus, filter_info])
+            btn_hist.click(lambda f, t, c: _reports_table(f, t, c),
+                           [hist_from, hist_to, hist_cat], reports_df_on_history)
+
+            # ---- Peringatan: klik baris -> tandai ----
+            alerts_df.select(saat_baris_alert_diklik, None,
+                             [ringkas_alert, alert_dipilih,
+                              btn_alert_ack, btn_alert_resolve])
+            btn_alert_ack.click(lambda a: do_tandai_alert(a, "Acknowledged"),
+                                [alert_dipilih], out_alert)
+            btn_alert_resolve.click(lambda a: do_tandai_alert(a, "Resolved"),
+                                    [alert_dipilih], out_alert)
+
+            # ---- Peta: klik baris -> setujui/tolak ----
+            map_df.select(saat_baris_peta_diklik, None,
+                          [ringkas_map, map_upd_id, btn_map_approve, btn_map_reject])
             btn_map_refresh.click(preview_map, None, map_box)
-            btn_map_approve.click(lambda u: do_map_decision(u, True), [map_upd_id],
-                                  [map_msg, *all_outputs])
-            btn_map_reject.click(lambda u: do_map_decision(u, False), [map_upd_id],
-                                 [map_msg, *all_outputs])
+            btn_map_approve.click(lambda u: do_map_decision(u, True), [map_upd_id], out_map)
+            btn_map_reject.click(lambda u: do_map_decision(u, False), [map_upd_id], out_map)
             btn_recap.click(do_recap, [recap_from, recap_to, recap_cat],
                             [recap_box, recap_msg, recap_state, csv_file, pdf_file])
             btn_csv.click(lambda r: do_export(r, "csv"), [recap_state], csv_file)
@@ -1197,13 +1374,6 @@ def launch():  # pragma: no cover
                 js="", head=head,
                 allowed_paths=[str(config.EXPORT_DIR), str(config.SAMPLES_DIR),
                                str(config.VAD_DIR)])
-
-
-def _seed_wrapper():
-    n = samples_gen.seed_demo_reports()
-    msg = (f"✅ {n} laporan demo simulasi dibuat." if n
-           else "ℹ Database sudah berisi data, tidak ada data demo tambahan.")
-    return (msg, *_refresh_all())
 
 
 if __name__ == "__main__":

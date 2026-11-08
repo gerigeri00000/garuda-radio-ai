@@ -382,3 +382,62 @@ def set_ticket_status(ticket_id: int, status: str, actor: str = "operator") -> d
     db.update_ticket_status(ticket_id, status, actor)
     return {"ok": True, "message": f"Tiket #{ticket_id} -> {status}."}
 
+
+def reject_ticket(ticket_id: int, actor: str = "operator") -> dict:
+    """Tolak tiket: status -> Rejected. Data tetap tersimpan sebagai catatan."""
+    t = db.get_ticket(ticket_id)
+    if not t:
+        return {"ok": False, "message": f"Tiket #{ticket_id} tidak ditemukan."}
+    if t["status"] in ("Completed", "Rejected"):
+        return {"ok": False,
+                "message": f"Tiket #{ticket_id} sudah {t['status']}, tidak bisa ditolak."}
+    db.update_ticket_status(ticket_id, "Rejected", actor)
+    return {"ok": True, "message": f"Tiket #{ticket_id} ditolak (Rejected)."}
+
+
+def _aksi_massal(ids: list[int], aksi, label: str) -> dict:
+    """Jalankan `aksi(id)` untuk banyak tiket, laporkan hasil PER BARIS.
+
+    Satu baris yang tidak memenuhi syarat TIDAK membatalkan sisanya. Operator
+    harus tahu persis mana yang berhasil dan mana yang dilewati, beserta
+    alasannya - bukan sekadar "berhasil" atau "gagal" secara keseluruhan.
+    """
+    if not ids:
+        return {"ok": False, "berhasil": 0, "dilewati": 0,
+                "message": "Tidak ada tiket terpilih. Centang dulu baris yang mau diproses."}
+    berhasil: list[str] = []
+    dilewati: list[str] = []
+    for tid in ids:
+        try:
+            r = aksi(int(tid))
+        except (TypeError, ValueError):
+            dilewati.append(f"#{tid} (ID tidak valid)")
+            continue
+        (berhasil if r["ok"] else dilewati).append(
+            f"#{tid}" if r["ok"] else f"#{tid} ({r['message']})")
+    bagian = []
+    if berhasil:
+        bagian.append(f"{len(berhasil)} tiket {label}: {', '.join(berhasil)}")
+    if dilewati:
+        bagian.append(f"{len(dilewati)} dilewati: {'; '.join(dilewati)}")
+    return {"ok": bool(berhasil), "berhasil": len(berhasil), "dilewati": len(dilewati),
+            "message": ". ".join(bagian) + "."}
+
+
+def approve_tickets_banyak(ids: list[int], actor: str = "operator") -> dict:
+    return _aksi_massal(ids, lambda i: approve_ticket(i, actor), "disetujui")
+
+
+def reject_tickets_banyak(ids: list[int], actor: str = "operator") -> dict:
+    return _aksi_massal(ids, lambda i: reject_ticket(i, actor), "ditolak")
+
+
+def delete_tickets_banyak(ids: list[int], actor: str = "operator") -> dict:
+    """Hapus permanen, hanya untuk tiket Rejected. Lihat db.delete_ticket."""
+    return _aksi_massal(ids, lambda i: (
+        {"ok": True, "message": f"Tiket #{i} dihapus."}
+        if db.delete_ticket(i, actor)
+        else {"ok": False, "message": "hanya tiket Rejected yang boleh dihapus"}
+    ), "dihapus")
+
+
