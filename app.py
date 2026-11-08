@@ -694,15 +694,68 @@ def build_ui() -> gr.Blocks:
         return demo
 
 
+VAD_BOOT_JS = """
+<script type="module">
+// GARUDA: deteksi suara (VAD) di browser -> memicu tombol rekam gr.Audio.
+(async () => {
+  const BASE = "__VAD_BASE__/";
+  const log = (...a) => console.log("[garuda-vad]", ...a);
+  const waitFor = (fn, ms = 20000) => new Promise((res, rej) => {
+    const t0 = Date.now();
+    const tick = () => {
+      const v = fn();
+      if (v) return res(v);
+      if (Date.now() - t0 > ms) return rej(new Error("timeout menunggu tombol rekam"));
+      setTimeout(tick, 250);
+    };
+    tick();
+  });
+
+  try {
+    const recBtn = await waitFor(() => document.querySelector(
+      '#audio_in button[aria-label*="ecord"], #audio_in .record-button'));
+    const stopBtn = () => document.querySelector(
+      '#audio_in button[aria-label*="top"], #audio_in .stop-button');
+
+    const mod = await import(BASE + "vad-web.bundle.min.js");
+    const vad = mod.default || mod;
+
+    const myvad = await vad.MicVAD.new({
+      baseAssetPath: BASE,
+      onnxWASMBasePath: BASE,
+      onSpeechStart: () => { const b = recBtn; if (b && !b.disabled) b.click(); },
+      onSpeechEnd: () => { const s = stopBtn(); if (s && !s.disabled) s.click(); },
+      onVADMisfire: () => { const s = stopBtn(); if (s) s.click(); },
+    });
+    await myvad.start();
+    window.__GARUDA_VAD__ = myvad;
+    log("aktif - mendengarkan suara");
+  } catch (e) {
+    console.error("[garuda-vad] gagal:", e);
+    window.__GARUDA_VAD_ERROR__ = String(e);
+  }
+})();
+</script>
+"""
+
+
 def launch():  # pragma: no cover
     db.init_db()
     port = int(os.environ.get("GARUDA_PORT", "7860"))
     demo = build_ui()
     demo.queue(default_concurrency_limit=2)
+    vad_base = "/gradio_api/file=" + config.VAD_DIR.as_posix()
+    head = (VAD_BOOT_JS.replace("__VAD_BASE__", vad_base)
+            if config.vad_assets_ready() else "")
     print(f"GARUDA Radio AI siap di http://127.0.0.1:{port}")
+    if not head:
+        print("Catatan: aset VAD belum ada - deteksi suara otomatis nonaktif. "
+              "Jalankan: setup_models.py vad")
     demo.launch(server_name="127.0.0.1", server_port=port, inbrowser=True,
                 footer_links=[], ssr_mode=False, theme=gr.themes.Soft(), css=CSS,
-                allowed_paths=[str(config.EXPORT_DIR), str(config.SAMPLES_DIR)])
+                js="", head=head,
+                allowed_paths=[str(config.EXPORT_DIR), str(config.SAMPLES_DIR),
+                               str(config.VAD_DIR)])
 
 
 def _seed_wrapper():

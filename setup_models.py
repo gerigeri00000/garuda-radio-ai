@@ -125,7 +125,45 @@ def status() -> int:
         ok = ok and (have or "3b" not in name)
         print(f"  llm/{name:32s} : {'OK ' + str(config.model_path(name,'llm')) if have else 'BELUM ADA'}")
     print(f"  tts/id_ID-news_tts             : {'OK' if TTS_MODEL.exists() else 'BELUM ADA (opsional, untuk audio demo)'}")
+    print(f"  vad (browser)                  : {'OK' if config.vad_assets_ready() else 'BELUM ADA (opsional, untuk deteksi suara otomatis)'}")
     return 0 if ok else 1
+
+
+VAD_CDN_ASSETS = [
+    ("https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@{ver}/dist/silero_vad.onnx",
+     "silero_vad.onnx"),
+    ("https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@{ver}/dist/bundle.min.js",
+     "vad-web.bundle.min.js"),
+    ("https://cdn.jsdelivr.net/npm/onnxruntime-web@{ort}/dist/ort.min.js",
+     "ort.min.js"),
+    ("https://cdn.jsdelivr.net/npm/onnxruntime-web@{ort}/dist/ort-wasm-simd-threaded.wasm",
+     "ort-wasm-simd-threaded.wasm"),
+]
+
+
+def install_vad() -> int:
+    """Unduh aset VAD sekali (butuh internet). Gagal keras bila tidak lengkap."""
+    import urllib.request
+
+    config.VAD_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"Mengunduh aset VAD ke {config.VAD_DIR} ...")
+    for url_tpl, name in VAD_CDN_ASSETS:
+        url = url_tpl.format(ver=config.VAD_ASSET_VERSION,
+                             ort=config.VAD_ONNXRT_VERSION)
+        dst = config.VAD_DIR / name
+        try:
+            with urllib.request.urlopen(url, timeout=180) as r, open(dst, "wb") as f:
+                f.write(r.read())
+            print(f"  OK  {name} ({dst.stat().st_size // 1024} KB)")
+        except Exception as exc:
+            print(f"  GAGAL {name}: {exc}")
+    if config.vad_assets_ready():
+        print("Aset VAD lengkap. Mode dengar terus bisa memakai deteksi otomatis.")
+        return 0
+    hilang = [f for f in config.VAD_REQUIRED_FILES
+              if not (config.VAD_DIR / f).exists()]
+    print(f"BELUM LENGKAP, file hilang: {', '.join(hilang)}")
+    return 1
 
 
 def main(argv: list[str]) -> int:
@@ -145,6 +183,8 @@ def main(argv: list[str]) -> int:
             fetch_llm(mapping.get(key, key))
         elif arg == "tts-id":
             fetch_tts()
+        elif arg == "vad":
+            return install_vad()
         else:
             print(f"Argumen tidak dikenal: {arg}")
             return 2
