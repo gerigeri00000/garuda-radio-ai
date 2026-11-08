@@ -106,6 +106,71 @@ def test_jalur_manual_tidak_berubah():
                  "auto_applied" not in event_actions())
 
 
+def test_klip_terlalu_pendek():
+    import loop
+    paths = sorted(config.SAMPLES_DIR.glob("*.wav"))
+    if not paths:
+        return check("dilewati: tidak ada sample audio", True)
+    res = loop.enqueue_clip(paths[0], source="live", _force_duration=0.4)
+    return (check("klip terlalu pendek ditolak",
+                  res["ok"] is False and res["reason"] == "too_short")
+            and check("alasan dijelaskan ke operator", bool(res["message"])))
+
+
+def test_antrian_penuh_buang_tertua():
+    import loop
+    paths = sorted(config.SAMPLES_DIR.glob("*.wav"))
+    if not paths:
+        return check("dilewati: tidak ada sample audio", True)
+    loop.reset_for_test()
+    # JANGAN pakai mode sync: antrian penuh hanya terjadi di mode async.
+    hasil = []
+    for _ in range(loop.QUEUE_MAX + 3):
+        hasil.append(loop.enqueue_clip(paths[0], source="live",
+                                       _force_duration=5.0))
+    stats = loop.worker_stats()
+    # 3 klip pertama dibuang; sisanya masuk (maks QUEUE_MAX)
+    ok = stats["discarded"] >= 3 and stats["antrian"] <= loop.QUEUE_MAX
+    loop.reset_for_test()
+    return check("antrian penuh membuang klip tertua", ok, str(stats))
+
+
+def test_dua_klip_jadi_dua_baris():
+    import pipeline
+    paths = sorted(config.SAMPLES_DIR.glob("*.wav"))
+    if len(paths) < 2:
+        return check("dilewati: butuh 2 sample audio", True)
+    a = pipeline.process_audio(paths[0], cfg, source="live", auto_apply=True)
+    b = pipeline.process_audio(paths[1], cfg, source="live", auto_apply=True)
+    ta = (a.get("action") or {}).get("transcript_id")
+    tb = (b.get("action") or {}).get("transcript_id")
+    return (check("klip pertama tersimpan", bool(ta))
+            and check("klip kedua tersimpan (tidak terdedupe)", bool(tb))
+            and check("dua transcript berbeda", ta != tb, f"{ta} vs {tb}"))
+
+
+def test_llm_mati_transkrip_tetap_ada():
+    import pipeline
+    paths = sorted(config.SAMPLES_DIR.glob("*.wav"))
+    if not paths:
+        return check("dilewati: tidak ada sample audio", True)
+    asli = pipeline.ai.analyze
+
+    def mati(*a, **k):
+        raise pipeline.ai.LLMNotAvailable("LLM tidak tersedia (uji)")
+
+    pipeline.ai.analyze = mati
+    try:
+        res = pipeline.process_audio(paths[0], cfg, source="live", auto_apply=True)
+    finally:
+        pipeline.ai.analyze = asli
+    return (check("transkrip tetap tersimpan saat LLM mati",
+                  bool(res.get("transcript")) and bool(
+                      (res.get("action") or {}).get("transcript_id")))
+            and check("laporan ditandai belum terklasifikasi",
+                      (res.get("analysis") or {}).get("llm_valid") is False))
+
+
 def run() -> int:
     results: list[bool] = []
     print("=" * 70)
@@ -114,7 +179,9 @@ def run() -> int:
     reset_db()
     for fn in (test_auto_apply_alert, test_map_tetap_pending,
                test_tiket_tetap_pending, test_status_update_tetap_usulan,
-               test_jalur_manual_tidak_berubah):
+               test_jalur_manual_tidak_berubah, test_klip_terlalu_pendek,
+               test_antrian_penuh_buang_tertua, test_dua_klip_jadi_dua_baris,
+               test_llm_mati_transkrip_tetap_ada):
         reset_db()
         results.append(fn())
     hits = sum(results)
