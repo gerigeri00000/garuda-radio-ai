@@ -197,6 +197,15 @@ def _dari_detail(detail) -> str:
         return ""
 
 
+def _json_path(detail) -> str:
+    """Ambil 'path' dari detail JSON; string kosong bila tidak bisa dibaca."""
+    try:
+        d = json.loads(detail) if isinstance(detail, str) else (detail or {})
+        return str(d.get("path") or "")
+    except Exception:
+        return ""
+
+
 def loop_feed(limit: int = 30) -> list[dict]:
     """Umpan mode dengar-terus: transisi antrian + ringkasan laporan terkait.
 
@@ -208,16 +217,40 @@ def loop_feed(limit: int = 30) -> list[dict]:
                       r.id AS report_id, r.category, r.summary, r.action AS r_action
                FROM events_log e
                LEFT JOIN reports r
-                 ON r.id = CAST(json_extract(e.detail, '$.report_id') AS INTEGER)
+                 ON r.id = CASE WHEN json_valid(e.detail)
+                                THEN CAST(json_extract(e.detail, '$.report_id') AS INTEGER)
+                                ELSE NULL END
                WHERE e.entity = 'loop'
                ORDER BY e.id DESC LIMIT ?""", (limit,)).fetchall())
+
+    # Baris 'processing' yang belum ditutup berarti aplikasi mati di tengah
+    # pemrosesan. Tanpa penanda ini operator akan melihat klip "Diproses"
+    # selamanya dan menunggu hasil yang tidak akan datang.
+    # Cocokkan pasangan terdekat dalam urutan KRONOLOGIS (id naik): setiap
+    # 'processing' ditutup oleh 'processed'/'failed' pertama sesudahnya dengan
+    # file yang sama. Dibandingkan kronologis karena id 'processed' bisa lebih
+    # kecil dari id 'processing' klip lain saat beberapa worker berjalan.
+    terputus: set[int] = set()
+    terbuka: dict[str, list[int]] = {}
+    for r in sorted(rows, key=lambda x: x["id"]):
+        kunci = _json_path(r["detail"]).lower()
+        if r["action"] == "processing":
+            terbuka.setdefault(kunci, []).append(r["id"])
+        elif r["action"] in ("processed", "failed"):
+            antre = terbuka.get(kunci)
+            if antre:
+                antre.pop(0)  # tutup 'processing' terlama untuk file ini
+    for antre in terbuka.values():
+        terputus.update(antre)
+
     label = {"queued": "Menunggu", "processing": "Diproses",
              "processed": "Selesai", "failed": "Gagal", "discarded": "Dibuang"}
     out = []
     for r in rows:
+        status = "Terputus" if r["id"] in terputus else label.get(r["action"], r["action"])
         out.append({
             "waktu": r["created_at"],
-            "status": label.get(r["action"], r["action"]),
+            "status": status,
             "ringkas": (r["summary"] or "")[:120] or _dari_detail(r["detail"]),
             "kategori": r["category"] or "",
             "aksi": r["r_action"] or "",

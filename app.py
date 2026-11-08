@@ -661,9 +661,15 @@ def build_ui() -> gr.Blocks:
                               [transcript_box, analysis_box, json_box, status_box, *all_outputs])
             btn_text.click(save_transcript_text, [txt_in], [status_box, *all_outputs])
             btn_refresh_main.click(_refresh_all, None, all_outputs)
-            btn_listen_on.click(do_start_listening, None, live_status)
-            btn_listen_off.click(do_stop_listening, None, live_status)
-            audio_in.stop_recording(do_ingest_clip, [audio_in], [live_status])
+            btn_listen_on.click(do_start_listening, None, live_status,
+                                concurrency_limit=None, concurrency_id="garuda_listen")
+            btn_listen_off.click(do_stop_listening, None, live_status,
+                                 concurrency_limit=None, concurrency_id="garuda_listen")
+            # Ingest tidak boleh berbagi antrian default dengan timer/LLM: kalau
+            # tersendat, transmisi berikutnya tidak pernah masuk dan loop mati diam.
+            audio_in.stop_recording(do_ingest_clip, [audio_in], [live_status],
+                                    concurrency_limit=None,
+                                    concurrency_id="garuda_ingest")
             live_timer = gr.Timer(2.0, active=True)
             live_timer.tick(live_queue_table, None, live_df)
             btn_dash_refresh.click(_refresh_all, None, all_outputs)
@@ -695,45 +701,67 @@ def build_ui() -> gr.Blocks:
 
 
 VAD_BOOT_JS = """
-<script type="module">
+<script src="__VAD_BASE__/vad-web.bundle.min.js" type="text/javascript"></script>
+<script>
 // GARUDA: deteksi suara (VAD) di browser -> memicu tombol rekam gr.Audio.
-(async () => {
-  const BASE = "__VAD_BASE__/";
-  const log = (...a) => console.log("[garuda-vad]", ...a);
-  const waitFor = (fn, ms = 20000) => new Promise((res, rej) => {
-    const t0 = Date.now();
-    const tick = () => {
-      const v = fn();
-      if (v) return res(v);
-      if (Date.now() - t0 > ms) return rej(new Error("timeout menunggu tombol rekam"));
-      setTimeout(tick, 250);
-    };
-    tick();
-  });
+// Bundle vad-web adalah UMD, jadi dimuat lewat <script>, BUKAN import().
+// Aset (silero_vad.onnx, vad.worklet.bundle.min.js) dicari relatif ke
+// __webpack_public_path__, yang HARUS di-set ke folder models/vad sebelum load.
+(function () {
+  var BASE = "__VAD_BASE__/";
+  var log = function () { console.log.apply(console, ["[garuda-vad]"].concat([].slice.call(arguments))); };
+  var listening = false;
 
-  try {
-    const recBtn = await waitFor(() => document.querySelector(
-      '#audio_in button[aria-label*="ecord"], #audio_in .record-button'));
-    const stopBtn = () => document.querySelector(
-      '#audio_in button[aria-label*="top"], #audio_in .stop-button');
-
-    const mod = await import(BASE + "vad-web.bundle.min.js");
-    const vad = mod.default || mod;
-
-    const myvad = await vad.MicVAD.new({
-      baseAssetPath: BASE,
-      onnxWASMBasePath: BASE,
-      onSpeechStart: () => { const b = recBtn; if (b && !b.disabled) b.click(); },
-      onSpeechEnd: () => { const s = stopBtn(); if (s && !s.disabled) s.click(); },
-      onVADMisfire: () => { const s = stopBtn(); if (s) s.click(); },
-    });
-    await myvad.start();
-    window.__GARUDA_VAD__ = myvad;
-    log("aktif - mendengarkan suara");
-  } catch (e) {
-    console.error("[garuda-vad] gagal:", e);
-    window.__GARUDA_VAD_ERROR__ = String(e);
+  function recBtn() {
+    return document.querySelector('#audio_in button[aria-label*="ecord"], #audio_in .record-button');
   }
+  function stopBtn() {
+    return document.querySelector('#audio_in button[aria-label*="top"], #audio_in .stop-button');
+  }
+  function clickSafe(el) { if (el && !el.disabled) el.click(); }
+
+  function waitFor(fn, ms) {
+    return new Promise(function (res, rej) {
+      var t0 = Date.now();
+      (function tick() {
+        var v = fn();
+        if (v) return res(v);
+        if (Date.now() - t0 > ms) return rej(new Error("timeout menunggu tombol rekam"));
+        setTimeout(tick, 250);
+      })();
+    });
+  }
+
+  window.__GARUDA_SET_LISTENING__ = async function (on) {
+    try {
+      if (on) {
+        if (listening) return true;
+        await waitFor(recBtn, 20000);
+        if (!window.vad || !window.vad.MicVAD) throw new Error("bundle vad tidak termuat");
+        window.__GARUDA_VAD__ = await window.vad.MicVAD.new({
+          onSpeechStart: function () { clickSafe(recBtn()); },
+          onSpeechEnd: function () { clickSafe(stopBtn()); },
+        });
+        await window.__GARUDA_VAD__.start();
+        listening = true;
+        log("aktif - mendengarkan suara");
+      } else {
+        if (window.__GARUDA_VAD__) {
+          try { window.__GARUDA_VAD__.pause(); } catch (e) {}
+          try { window.__GARUDA_VAD__.destroy ? window.__GARUDA_VAD__.destroy() : null; } catch (e) {}
+          window.__GARUDA_VAD__ = null;
+        }
+        listening = false;
+        log("nonaktif - mikrofon dilepas");
+      }
+      return true;
+    } catch (e) {
+      console.error("[garuda-vad] gagal:", e);
+      window.__GARUDA_VAD_ERROR__ = String(e);
+      return false;
+    }
+  };
+  log("skrip dimuat (menunggu perintah Mulai)");
 })();
 </script>
 """

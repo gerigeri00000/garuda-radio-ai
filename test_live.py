@@ -7,6 +7,7 @@ test_scenarios.py (baseline 47/47 tidak disentuh).
 from __future__ import annotations
 
 import sys
+import time
 
 import actions
 import config
@@ -175,6 +176,121 @@ def test_feed_menampilkan_kategori_dan_aksi():
                       str(r["report_id"])))
 
 
+def test_feed_tahan_detail_json_rusak():
+    """Satu baris audit rusak tidak boleh mengosongkan seluruh panel."""
+    db.log("loop", None, "queued", "bukan json {{{", "system")
+    try:
+        feed = db.loop_feed(10)
+        ok = isinstance(feed, list)
+    except Exception as exc:
+        return check("loop_feed tahan detail rusak", False, str(exc)[:80])
+    return check("loop_feed tahan detail rusak", ok, f"{len(feed)} baris")
+
+
+def test_stop_worker_tidak_hang_saat_antrian_penuh():
+    """Hentikan harus selalu kembali, walau antrian penuh."""
+    import loop
+    loop.reset_for_test()
+    for _ in range(loop.QUEUE_MAX):
+        loop.enqueue_clip("x.wav", source="live", _force_duration=5.0)
+    t0 = time.time()
+    loop.stop_worker()
+    durasi = time.time() - t0
+    loop.reset_for_test()
+    return check("stop_worker tidak hang saat antrian penuh", durasi < 2.0,
+                 f"{durasi:.2f}s")
+
+
+def test_baris_processing_yatim_ditandai_terputus():
+    """Aplikasi mati saat klip sedang diproses: baris jangan selamanya
+    "Diproses" - operator harus tahu transmisi itu tidak selesai."""
+    from pathlib import Path
+    p = str(Path("samples") / "mati_di_tengah.wav")
+    db.log("loop", None, "processing", {"path": p, "source": "live"}, "system")
+    feed = db.loop_feed(50)
+    baris = [r for r in feed if r["ringkas"].endswith("mati_di_tengah.wav")]
+    if not baris:
+        return check("baris pemrosesan lama ditemukan", False, f"{len(feed)} baris")
+    return check("baris processing yatim ditandai Terputus",
+                 baris[0]["status"] == "Terputus", baris[0]["status"])
+
+
+def test_baris_processing_selesai_tetap_selesai():
+    import loop
+    paths = sorted(config.SAMPLES_DIR.glob("*.wav"))
+    if not paths:
+        return check("dilewati: tidak ada sample audio", True)
+    loop.reset_for_test()
+    loop.set_sync_for_test(True)
+    loop.enqueue_clip(paths[0], source="live")
+    feed = db.loop_feed(20)
+    loop.reset_for_test()
+    selesai = [r for r in feed if r["status"] == "Selesai"]
+    diproses = [r for r in feed if r["ringkas"].endswith(paths[0].name)]
+    return (check("ada baris Selesai", bool(selesai))
+            and check("baris processing yang selesai bukan Terputus",
+                      all(r["status"] != "Terputus" for r in diproses),
+                      str([r["status"] for r in diproses])))
+
+
+def test_klip_tidak_yatim_saat_antrian_penuh_lalu_stop():
+    """Reviewer #7/#8: saat antrian penuh, klip yang dipotong harus DICATAT,
+    dan stop_worker tidak boleh meninggalkan sentinel yang menghabiskan
+    satu slot sehingga klip berikutnya hilang tanpa jejak.
+
+    Catatan: tanpa pekerja berjalan, 2 klip terakhir memang terpotong.
+    """
+    import loop
+    loop.reset_for_test()
+    for _ in range(loop.QUEUE_MAX + 2):
+        loop.enqueue_clip("x.wav", source="live", _force_duration=5.0)
+    sebelum = loop.worker_stats()
+    loop.stop_worker()
+    sesudah = loop.worker_stats()
+    loop.reset_for_test()
+    return (check("klip yang dipotong tercatat 'discarded'",
+                  sebelum["discarded"] >= 2, str(sebelum))
+            and check("sentinel stop tidak memakan slot antrian",
+                      sesudah["antrian"] == sebelum["antrian"], str(sesudah)))
+
+
+def test_stop_lalu_start_tetap_memproses_klip_baru():
+    """Stop lalu start harus melayani klip berikutnya (worker benar-benar
+    menyala lagi, bukan tertinggal dengan event berhenti yang masih set)."""
+    import loop
+    loop.reset_for_test()
+    loop.start_worker(cfg)
+    loop.stop_worker()
+    loop.start_worker(cfg)
+    paths = sorted(config.SAMPLES_DIR.glob("*.wav"))
+    if not paths:
+        loop.reset_for_test()
+        return check("dilewati: tidak ada sample audio", True)
+    loop.enqueue_clip(paths[0], source="live")
+    loop.drain(120)
+    st = loop.worker_stats()
+    loop.reset_for_test()
+    return check("worker hidup lagi setelah stop lalu start",
+                 st["processed"] >= 1, str(st))
+
+
+def test_klip_tetap_diproses_setelah_stop_lalu_start():
+    """Stop lalu start tidak boleh meninggalkan klip yatim di antrian."""
+    import loop
+    loop.reset_for_test()
+    loop.start_worker(cfg)
+    paths = sorted(config.SAMPLES_DIR.glob("*.wav"))
+    if not paths:
+        loop.reset_for_test()
+        return check("dilewati: tidak ada sample audio", True)
+    loop.enqueue_clip(paths[0], source="live")
+    loop.drain(120)
+    st = loop.worker_stats()
+    loop.reset_for_test()
+    return check("klip diproses jadi Selesai",
+                 st["processed"] >= 1 and st["failed"] == 0, str(st))
+
+
 def test_dua_klip_jadi_dua_baris():
     import pipeline
     paths = sorted(config.SAMPLES_DIR.glob("*.wav"))
@@ -222,6 +338,12 @@ def run() -> int:
                test_jalur_manual_tidak_berubah, test_klip_terlalu_pendek,
                test_antrian_penuh_buang_tertua, test_loop_feed_dari_db,
                test_vad_assets_ready_graceful, test_feed_menampilkan_kategori_dan_aksi,
+               test_feed_tahan_detail_json_rusak, test_stop_worker_tidak_hang_saat_antrian_penuh,
+               test_baris_processing_yatim_ditandai_terputus,
+               test_baris_processing_selesai_tetap_selesai,
+               test_klip_tidak_yatim_saat_antrian_penuh_lalu_stop,
+               test_stop_lalu_start_tetap_memproses_klip_baru,
+               test_klip_tetap_diproses_setelah_stop_lalu_start,
                test_dua_klip_jadi_dua_baris,
                test_llm_mati_transkrip_tetap_ada):
         reset_db()

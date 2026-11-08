@@ -68,32 +68,41 @@ def enqueue_clip(path: str | Path, source: str = "live",
 
     if _SYNC_FOR_TEST:
         _proses(path, source)
-        _STATS["queued"] += 1
+        with _LOCK:
+            _STATS["queued"] += 1
         return {"ok": True, "reason": "ok",
                 "message": f"Klip {durasi:.1f}s masuk antrian."}
 
     try:
         _Q.put_nowait((path, source))
     except queue.Full:
-        # buang klip tertua supaya transmisi terbaru tetap terlayani
+        # Buang klip tertua supaya transmisi terbaru tetap terlayani.
+        # Klip yang dibuang HARUS tercatat, kalau tidak operator kehilangan
+        # jejak bahwa ada transmisi yang tidak pernah diproses.
+        tertua = None
         try:
-            _Q.get_nowait()
+            tertua = _Q.get_nowait()
             _Q.task_done()
-            _STATS["discarded"] += 1
-            _catat("discarded", path, source, {"reason": "antrian_penuh"})
         except queue.Empty:
             pass
+        with _LOCK:
+            _STATS["discarded"] += 1
+        if tertua is not None:
+            _catat("discarded", tertua[0], tertua[1], {"reason": "antrian_penuh"})
         try:
             _Q.put_nowait((path, source))
         except queue.Full:
+            _catat("discarded", path, source, {"reason": "antrian_penuh"})
             return {"ok": False, "reason": "full",
                     "message": "Antrian penuh - klip dibuang."}
-        _STATS["queued"] += 1
+        with _LOCK:
+            _STATS["queued"] += 1
         return {"ok": False, "reason": "full",
                 "message": "Antrian penuh - klip terlama dibuang agar yang "
                            "terbaru terlayani."}
 
-    _STATS["queued"] += 1
+    with _LOCK:
+        _STATS["queued"] += 1
     return {"ok": True, "reason": "ok", "message": f"Klip {durasi:.1f}s masuk antrian."}
 
 
@@ -101,7 +110,8 @@ def _proses(path: Path, source: str) -> None:
     _catat("processing", path, source)
     try:
         res = pipeline.process_audio(path, _CFG, source=source, auto_apply=True)
-        _STATS["processed"] += 1
+        with _LOCK:
+            _STATS["processed"] += 1
         # report_id & transcript_id ada di dalam res["action"], bukan di res.
         act = res.get("action") or {}
         _catat("processed", path, source,
@@ -109,16 +119,17 @@ def _proses(path: Path, source: str) -> None:
                 "category": (res.get("analysis") or {}).get("category"),
                 "transcript_id": act.get("transcript_id")})
     except Exception as exc:
-        _STATS["failed"] += 1
+        with _LOCK:
+            _STATS["failed"] += 1
         _catat("failed", path, source, {"error": str(exc)[:300]})
 
 
-def _worker() -> None:
-    while True:
-        item = _Q.get()
-        if item is None:  # sentinel berhenti
-            _Q.task_done()
-            return
+def _worker(stop: threading.Event) -> None:
+    while not stop.is_set():
+        try:
+            item = _Q.get(timeout=0.2)
+        except queue.Empty:
+            continue  # periksa event berhenti secara berkala
         path, source = item
         try:
             _proses(path, source)
@@ -133,34 +144,49 @@ def start_worker(cfg: dict) -> None:
     with _LOCK:
         if _THREAD is not None and _THREAD.is_alive():
             return
-        _THREAD = threading.Thread(target=_worker, name="garuda-live-loop",
-                                   daemon=True)
-        _THREAD.start()
+        stop = threading.Event()
+        t = threading.Thread(target=_worker, args=(stop,),
+                             name="garuda-live-loop", daemon=True)
+        t._garuda_stop = stop  # type: ignore[attr-defined]
+        _THREAD = t
+        t.start()
 
 
 def stop_worker() -> None:
+    """Minta pekerja berhenti. Klip yang sudah di antrian TIDAK dibuang.
+
+    Tidak memakai sentinel di antrian: sentinel bisa memakan satu slot dan
+    membuat klip berikutnya yatim, terutama saat antrian penuh.
+    """
     global _THREAD
     with _LOCK:
-        if _THREAD is None or not _THREAD.is_alive():
-            return
-        _Q.put(None)
+        t = _THREAD
         _THREAD = None
+    if t is None or not t.is_alive():
+        return
+    stop = getattr(t, "_garuda_stop", None)
+    if stop is not None:
+        stop.set()
+    t.join(timeout=5.0)
 
 
 def drain(timeout: float = 60.0) -> None:
     """Tunggu sampai semua klip dalam antrian selesai diproses (untuk uji)."""
     batas = time.time() + timeout
     while time.time() < batas:
-        if _Q.empty() and _STATS["queued"] <= (_STATS["processed"]
-                                               + _STATS["failed"]
-                                               + _STATS["discarded"]):
+        with _LOCK:
+            tuntas = _STATS["queued"] <= (_STATS["processed"]
+                                          + _STATS["failed"]
+                                          + _STATS["discarded"])
+        if _Q.empty() and tuntas:
             return
         time.sleep(0.1)
 
 
 def worker_stats() -> dict:
     """Diagnostik. UI TIDAK memakai ini - panel membaca DB."""
-    out = dict(_STATS)
+    with _LOCK:
+        out = dict(_STATS)
     out["antrian"] = _Q.qsize()
     return out
 
@@ -175,11 +201,13 @@ def reset_for_test() -> None:
     """Kosongkan antrian & statistik di antara test."""
     global _SYNC_FOR_TEST
     _SYNC_FOR_TEST = False
+    stop_worker()
     while True:
         try:
             _Q.get_nowait()
             _Q.task_done()
         except queue.Empty:
             break
-    for k in _STATS:
-        _STATS[k] = 0
+    with _LOCK:
+        for k in _STATS:
+            _STATS[k] = 0

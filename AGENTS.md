@@ -150,11 +150,23 @@ masuk `loop.enqueue_clip()` → satu thread pekerja memanggil
 **Perintah terkait:**
 ```powershell
 .\.venv\Scripts\python.exe setup_models.py vad   # unduh aset VAD (butuh internet, sekali)
-.\.venv\Scripts\python.exe test_live.py          # 12 pemeriksaan mode dengar terus
+.\.venv\Scripts\python.exe test_live.py          # 19 pemeriksaan mode dengar terus
 ```
 
+**Hal-hal yang mudah dirusak saat mengubah `loop.py`:**
+- `stop_worker()` memakai `threading.Event` per-thread, **bukan** sentinel `None` di
+  antrian. Sentinel memakan satu slot dan bisa membuat klip berikutnya yatim
+  (terutama saat antrian penuh).
+- Setiap klip yang dipotong karena antrian penuh **wajib** dicatat `discarded`
+  ke `events_log`; kalau tidak, operator kehilangan jejak transmisi yang hilang.
+- `stop_recording` dan tombol Mulai/Hentikan memakai `concurrency_id` terpisah
+  (`garuda_ingest`, `garuda_listen`). Jangan biarkan ingest berbagi antrian default
+  dengan timer/LLM — kalau tersendat, loop mati diam-diam.
+- Baris `processing` tanpa penutup ditampilkan sebagai **Terputus** (aplikasi mati
+  di tengah proses). Pemasangannya kronologis per file, bukan berdasarkan id saja.
+
 **Belum terverifikasi:** deteksi suara sungguhan di browser (butuh mic manusia).
-Yang sudah terbukti: halaman memuat skrip VAD, keempat aset HTTP 200, dan alur
+Yang sudah terbukti: halaman memuat skrip VAD, kelima aset HTTP 200, dan alur
 klip → antrian → aksi lewat handler langsung.
 
 ---

@@ -62,6 +62,7 @@ VAD_DIR = MODELS_DIR / "vad"
 VAD_REQUIRED_FILES = [
     "silero_vad.onnx",
     "vad-web.bundle.min.js",
+    "vad.worklet.bundle.min.js",
     "ort.min.js",
     "ort-wasm-simd-threaded.wasm",
 ]

@@ -132,6 +132,8 @@ def status() -> int:
 VAD_CDN_ASSETS = [
     ("https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@{ver}/dist/silero_vad.onnx",
      "silero_vad.onnx"),
+    ("https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@{ver}/dist/vad.worklet.bundle.min.js",
+     "vad.worklet.bundle.min.js"),
     ("https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@{ver}/dist/bundle.min.js",
      "vad-web.bundle.min.js"),
     ("https://cdn.jsdelivr.net/npm/onnxruntime-web@{ort}/dist/ort.min.js",
@@ -154,7 +156,11 @@ def install_vad() -> int:
         try:
             with urllib.request.urlopen(url, timeout=180) as r, open(dst, "wb") as f:
                 f.write(r.read())
-            print(f"  OK  {name} ({dst.stat().st_size // 1024} KB)")
+            ukuran = dst.stat().st_size
+            if ukuran < 256:
+                print(f"  CURIGA {name}: hanya {ukuran} byte")
+            else:
+                print(f"  OK  {name} ({ukuran // 1024} KB)")
         except Exception as exc:
             print(f"  GAGAL {name}: {exc}")
     if config.vad_assets_ready():
