@@ -102,10 +102,12 @@ def _proses(path: Path, source: str) -> None:
     try:
         res = pipeline.process_audio(path, _CFG, source=source, auto_apply=True)
         _STATS["processed"] += 1
+        # report_id & transcript_id ada di dalam res["action"], bukan di res.
+        act = res.get("action") or {}
         _catat("processed", path, source,
-               {"report_id": res.get("report_id"),
+               {"report_id": act.get("report_id"),
                 "category": (res.get("analysis") or {}).get("category"),
-                "transcript_id": (res.get("action") or {}).get("transcript_id")})
+                "transcript_id": act.get("transcript_id")})
     except Exception as exc:
         _STATS["failed"] += 1
         _catat("failed", path, source, {"error": str(exc)[:300]})

@@ -21,6 +21,7 @@ import ai
 import audio
 import config
 import database as db
+import loop
 import map_view
 import pipeline
 import reports
@@ -209,6 +210,47 @@ def _refresh_all():
 
 
 LIVE_COLS = ["Waktu", "Status", "Ringkasan", "Kategori", "Aksi", "ID Laporan"]
+
+_LISTENING = threading.Event()
+
+
+def do_start_listening():
+    """Nyalakan mode dengar terus (antrian + thread pekerja).
+
+    Aset VAD hanya dibutuhkan untuk deteksi suara otomatis. Tanpa aset itu,
+    antrian tetap bisa dipakai lewat tombol rekam manual - jadi mode tetap
+    dinyalakan, dengan peringatan yang jelas.
+    """
+    loop.start_worker(cfg)
+    _LISTENING.set()
+    if not config.vad_assets_ready():
+        return ("Mode dengar terus: **AKTIF (tanpa deteksi otomatis)** — aset VAD "
+                "belum ada, jadi rekam manual lalu tekan stop. Untuk deteksi suara "
+                "otomatis jalankan: `.venv\\Scripts\\python.exe setup_models.py vad` "
+                "lalu muat ulang halaman.")
+    return ("Mode dengar terus: **AKTIF** — bicara ke mikrofon, setiap transmisi "
+            "dipotong & diproses otomatis.")
+
+
+def do_stop_listening():
+    _LISTENING.clear()
+    loop.stop_worker()
+    return "Mode dengar terus: **nonaktif**. Klip yang sudah masuk antrian tetap diproses."
+
+
+def do_ingest_clip(audio_path):
+    """Dipanggil setiap kali satu klip rekaman selesai (mic manual atau VAD)."""
+    if not _LISTENING.is_set():
+        return "Mode dengar terus nonaktif — klip diabaikan."
+    if not audio_path:
+        return "Klip kosong — diabaikan."
+    try:
+        res = loop.enqueue_clip(audio_path, source="live")
+    except Exception as exc:
+        traceback.print_exc()
+        return f"❌ Gagal memasukkan klip: {exc}"
+    return res["message"]
+
 
 
 def live_queue_table():
@@ -497,6 +539,10 @@ def build_ui() -> gr.Blocks:
                 demo_result = gr.HTML("")
 
                 gr.Markdown("### Antrian mode dengar terus")
+                with gr.Row():
+                    btn_listen_on = gr.Button("🟢 Mulai dengar terus", variant="primary",
+                                              scale=1)
+                    btn_listen_off = gr.Button("⏹ Hentikan", scale=1)
                 live_status = gr.Markdown("Mode dengar terus: **nonaktif**.")
                 live_df = gr.Dataframe(headers=LIVE_COLS, value=live_queue_table(),
                                        interactive=False, wrap=True,
@@ -615,6 +661,9 @@ def build_ui() -> gr.Blocks:
                               [transcript_box, analysis_box, json_box, status_box, *all_outputs])
             btn_text.click(save_transcript_text, [txt_in], [status_box, *all_outputs])
             btn_refresh_main.click(_refresh_all, None, all_outputs)
+            btn_listen_on.click(do_start_listening, None, live_status)
+            btn_listen_off.click(do_stop_listening, None, live_status)
+            audio_in.stop_recording(do_ingest_clip, [audio_in], [live_status])
             live_timer = gr.Timer(2.0, active=True)
             live_timer.tick(live_queue_table, None, live_df)
             btn_dash_refresh.click(_refresh_all, None, all_outputs)

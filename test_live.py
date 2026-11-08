@@ -149,6 +149,32 @@ def test_loop_feed_dari_db():
     return check("feed antrian dibaca dari database", ok, f"{len(feed)} baris")
 
 
+def test_vad_assets_ready_graceful():
+    return check("vad_assets_ready() tidak crash saat aset belum ada",
+                 isinstance(config.vad_assets_ready(), bool))
+
+
+def test_feed_menampilkan_kategori_dan_aksi():
+    """Baris 'Selesai' harus memuat kategori & aksi, bukan kosong."""
+    import loop
+    paths = sorted(config.SAMPLES_DIR.glob("*.wav"))
+    if not paths:
+        return check("dilewati: tidak ada sample audio", True)
+    loop.reset_for_test()
+    loop.set_sync_for_test(True)
+    loop.enqueue_clip(paths[0], source="live")
+    feed = db.loop_feed(10)
+    loop.reset_for_test()
+    selesai = [r for r in feed if r["status"] == "Selesai"]
+    if not selesai:
+        return check("ada baris Selesai di feed", False, f"{len(feed)} baris")
+    r = selesai[0]
+    return (check("baris Selesai punya kategori", bool(r["kategori"]), r["kategori"])
+            and check("baris Selesai punya aksi", bool(r["aksi"]), r["aksi"])
+            and check("baris Selesai punya report_id", bool(r["report_id"]),
+                      str(r["report_id"])))
+
+
 def test_dua_klip_jadi_dua_baris():
     import pipeline
     paths = sorted(config.SAMPLES_DIR.glob("*.wav"))
@@ -195,6 +221,7 @@ def run() -> int:
                test_tiket_tetap_pending, test_status_update_tetap_usulan,
                test_jalur_manual_tidak_berubah, test_klip_terlalu_pendek,
                test_antrian_penuh_buang_tertua, test_loop_feed_dari_db,
+               test_vad_assets_ready_graceful, test_feed_menampilkan_kategori_dan_aksi,
                test_dua_klip_jadi_dua_baris,
                test_llm_mati_transkrip_tetap_ada):
         reset_db()

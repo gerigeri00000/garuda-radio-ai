@@ -53,6 +53,28 @@ DEFAULTS = {
 #   CREATE_TICKET -> Pending, UPDATE_MAP -> Pending Approval, UPDATE_STATUS -> usulan.
 AUTO_APPLY_ACTIONS = {"CREATE_ALERT"}
 
+# Aset VAD browser (deteksi suara) - diunduh sekali lewat setup_models.py vad.
+# Versi dipin supaya nama file aset tidak bergeser tanpa disadari.
+VAD_ASSET_VERSION = "0.0.9"
+VAD_ONNXRT_VERSION = "1.18.0"
+VAD_DIR = MODELS_DIR / "vad"
+
+VAD_REQUIRED_FILES = [
+    "silero_vad.onnx",
+    "vad-web.bundle.min.js",
+    "ort.min.js",
+    "ort-wasm-simd-threaded.wasm",
+]
+
+
+def vad_assets_ready() -> bool:
+    """True bila semua aset VAD ada. Tidak pernah crash."""
+    try:
+        return all((VAD_DIR / f).exists() for f in VAD_REQUIRED_FILES)
+    except Exception:
+        return False
+
+
 
 def load_config() -> dict:
     """Gabungkan default dengan config.json (bila ada)."""
