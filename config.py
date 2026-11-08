@@ -53,6 +53,9 @@ DEFAULTS = {
 #   CREATE_TICKET -> Pending, UPDATE_MAP -> Pending Approval, UPDATE_STATUS -> usulan.
 AUTO_APPLY_ACTIONS = {"CREATE_ALERT"}
 
+# Lama sunyi (detik) sebelum satu transmisi dianggap selesai dan dipotong.
+SILENCE_SECONDS = 3.0
+
 # Aset VAD browser (deteksi suara) - diunduh sekali lewat setup_models.py vad.
 # Versi dipin supaya nama file aset tidak bergeser tanpa disadari.
 VAD_ASSET_VERSION = "0.0.9"

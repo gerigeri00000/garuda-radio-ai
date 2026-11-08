@@ -214,86 +214,99 @@ LIVE_COLS = ["Waktu", "Status", "Ringkasan", "Kategori", "Aksi", "ID Laporan"]
 _LISTENING = threading.Event()
 
 
-def vad_report(status):
+def vad_report(gabung):
     """Terjemahkan status VAD dari browser menjadi pesan yang jujur ke operator.
 
-    Dipanggil berkala setelah Mulai. Tanpa ini, kegagalan memuat WASM atau
-    penolakan izin mikrofon membuat operator melihat "AKTIF" padahal tidak
-    ada suara yang pernah terdeteksi.
+    `gabung` berformat "status|info" dari skrip VAD. Dipanggil berkala setelah
+    Mulai. Tanpa ini, kegagalan memuat WASM atau penolakan izin mikrofon
+    membuat operator melihat "AKTIF" padahal tidak ada suara yang terdeteksi.
     """
-    status = (status or "belum").strip()
+    teks = str(gabung or "belum|")
+    status, _, info = teks.partition("|")
+    status = status.strip()
+    info = info.strip()
     if not _LISTENING.is_set():
-        return "Mode dengar terus: **nonaktif**."
+        return "Status: **nonaktif**."
     if status == "aktif":
-        return ("Mode dengar terus: **AKTIF** — bicara ke mikrofon, setiap "
-                "transmisi dipotong & diproses otomatis.")
+        dasar = (f"Status: **MENDENGARKAN** — mikrofon streaming. Sunyi "
+                 f"{config.SILENCE_SECONDS:.0f} detik = potong & proses otomatis.")
+        return f"{dasar}\n\n<span class='muted'>Terakhir: {html.escape(info[:160])}</span>"
     if status.startswith("gagal"):
-        return (f"❌ Mode dengar terus **AKTIF untuk rekam manual**, tetapi "
-                f"deteksi suara otomatis GAGAL: `{status[7:].strip()[:180]}`. "
-                "Periksa izin mikrofon browser, lalu tekan Hentikan dan Mulai lagi.")
+        return (f"❌ Deteksi suara otomatis **GAGAL**: "
+                f"`{status[5:].strip()[:200]}`. Periksa izin mikrofon browser, "
+                "lalu tekan Hentikan dan Mulai lagi.")
+    if status == "menyiapkan":
+        return "Status: **menyiapkan** — memuat model deteksi suara..."
     if status in ("nonaktif", "belum"):
-        return ("⚠️ Mode dengar terus **AKTIF untuk rekam manual**, tetapi "
-                "deteksi suara otomatis belum menyala. Tekan Hentikan lalu Mulai "
-                "lagi dan izinkan akses mikrofon.")
-    return f"Mode dengar terus: **AKTIF** (status deteksi: {status})."
+        return ("⚠️ Mode menyala tetapi deteksi suara **belum menyala**. "
+                "Tekan Hentikan lalu Mulai lagi, dan izinkan akses mikrofon.")
+    return f"Status: **{status}**"
 
 
 def do_start_listening():
     """Nyalakan mode dengar terus (antrian + thread pekerja).
 
-    Aset VAD hanya dibutuhkan untuk deteksi suara otomatis. Tanpa aset itu,
-    antrian tetap bisa dipakai lewat tombol rekam manual - jadi mode tetap
-    dinyalakan, dengan peringatan yang jelas.
+    Aset VAD hanya dibutuhkan untuk deteksi suara otomatis. Tanpa aset itu
+    mikrofon tidak bisa dipotong otomatis sama sekali - jadi mode tetap
+    dinyalakan dengan peringatan jelas, dan operator masih bisa memproses
+    file lewat panel upload manual.
     """
     loop.start_worker(cfg)
     _LISTENING.set()
     if not config.vad_assets_ready():
         return ("Mode dengar terus: **AKTIF (tanpa deteksi otomatis)** — aset VAD "
-                "belum ada, jadi rekam manual lalu tekan stop. Untuk deteksi suara "
-                "otomatis jalankan: `.venv\\Scripts\\python.exe setup_models.py vad` "
-                "lalu muat ulang halaman.")
-    return ("Mode dengar terus: **AKTIF** — bicara ke mikrofon, setiap transmisi "
-            "dipotong & diproses otomatis.")
+                "belum ada, jadi mikrofon TIDAK akan dipotong otomatis. Jalankan: "
+                "`.venv\\Scripts\\python.exe setup_models.py vad` lalu muat ulang "
+                "halaman. Sementara itu pakai panel 'Proses file manual'.")
+    return ("Status: **MENDENGARKAN** — mikrofon streaming. Setiap transmisi "
+            f"dipotong setelah sunyi {config.SILENCE_SECONDS:.0f} detik dan "
+            "langsung diproses. Tidak perlu menekan tombol apa pun.")
 
 
 def do_start_listening_and_watch():
     """Mulai mode + nyalakan pemantau status VAD."""
-    return do_start_listening(), gr.Timer(3.0, active=True), gr.Textbox(value="belum")
+    return do_start_listening(), gr.Timer(2.0, active=True), gr.Textbox(value="menyiapkan|")
 
 
 def do_stop_listening_and_watch():
     """Hentikan mode + matikan pemantau status VAD."""
-    return do_stop_listening(), gr.Timer(3.0, active=False), gr.Textbox(value="nonaktif")
+    return do_stop_listening(), gr.Timer(2.0, active=False), gr.Textbox(value="nonaktif|")
 
 
 def do_stop_listening():
     _LISTENING.clear()
     hasil = loop.stop_worker()
     if not hasil["stopped"]:
-        return (f"Mode dengar terus: **{hasil['message']}** "
-                "Klip yang sudah masuk antrian tetap diproses.")
-    return "Mode dengar terus: **nonaktif**. Klip yang sudah masuk antrian tetap diproses."
+        return (f"Status: **{hasil['message']}** "
+                "Potongan yang sudah masuk antrian tetap diproses.")
+    return "Status: **nonaktif**. Potongan yang sudah masuk antrian tetap diproses."
 
 
-def do_ingest_clip(audio_path):
-    """Dipanggil setiap kali satu klip rekaman selesai (mic manual atau VAD).
+def do_ingest_clip(audio_path, durasi=None):
+    """Terima satu potongan transmisi dari browser dan masukkan ke antrian.
 
-    Endpoint ini terbuka lewat API Gradio. Karena klip yang masuk diproses
-    dengan auto_apply=True (alert langsung berlaku), ia TIDAK boleh jalan
-    kecuali operator benar-benar sudah menekan Mulai di sesi ini.
+    Dipanggil OTOMATIS oleh skrip VAD setiap kali terdeteksi sunyi cukup lama.
+    Tidak ada tombol yang perlu ditekan operator.
+
+    Endpoint ini terbuka lewat HTTP. Karena klip yang masuk diproses dengan
+    auto_apply=True (alert langsung berlaku), ia TIDAK boleh jalan kecuali
+    operator sudah menekan Mulai di sesi ini.
     """
     if not _LISTENING.is_set():
-        return "Mode dengar terus nonaktif — klip diabaikan."
+        return "Mode dengar terus nonaktif — potongan diabaikan."
     if not audio_path:
-        return "Klip kosong — diabaikan."
-    # Endpoint ini terbuka lewat API Gradio, jadi jangan percaya path mentah:
-    # hanya terima berkas audio yang benar-benar ada di disk.
+        return "Potongan kosong — diabaikan."
+    # Jangan percaya path mentah dari browser: hanya terima audio yang nyata.
     berkas = Path(str(audio_path))
     if not berkas.is_file() or berkas.suffix.lower() not in (
             ".wav", ".mp3", ".ogg", ".m4a", ".flac", ".webm"):
         return "❌ Klip ditolak: bukan berkas audio yang sah."
     try:
-        res = loop.enqueue_clip(berkas, source="live")
+        paksa = float(durasi) if durasi is not None else None
+    except (TypeError, ValueError):
+        paksa = None
+    try:
+        res = loop.enqueue_clip(berkas, source="live", _force_duration=paksa)
     except Exception as exc:
         traceback.print_exc()
         return f"❌ Gagal memasukkan klip: {exc}"
@@ -548,33 +561,67 @@ def build_ui() -> gr.Blocks:
         with gr.Tabs():
             # ---------------- Tab 1: Monitor & Analisis ----------------
             with gr.Tab("🎙 Monitor & Analisis"):
+                gr.Markdown("### Mode dengar terus")
+                gr.Markdown("<span class='muted'>Tekan <b>Mulai</b> sekali. Mikrofon akan "
+                            "streaming terus; setiap transmisi dipotong otomatis setelah "
+                            f"sunyi {config.SILENCE_SECONDS:.0f} detik dan langsung diproses. "
+                            "Tidak perlu menekan tombol apa pun lagi.</span>")
                 with gr.Row():
-                    with gr.Column(scale=5):
-                        with gr.Group():
-                            gr.Markdown("**Input audio** (mikrofon browser, upload file, atau rekaman radio)")
-                            audio_in = gr.Audio(sources=["microphone", "upload"], type="filepath",
-                                                label="Rekam atau unggah audio (wav/mp3/m4a/ogg)",
+                    btn_listen_on = gr.Button("🟢 Mulai dengar terus", variant="primary",
+                                              scale=1)
+                    btn_listen_off = gr.Button("⏹ Hentikan", scale=1)
+                live_status = gr.Markdown("Status: **nonaktif**.")
+                # Satu kotak tersembunyi berisi "status|info" dari skrip VAD.
+                vad_state = gr.Textbox(value="belum|", visible=False,
+                                       elem_id="vad_state", label="status VAD")
+                vad_timer = gr.Timer(2.0, active=False)
+                # Pintu masuk API untuk potongan audio dari skrip VAD.
+                # Tidak terlihat; hanya dipakai lewat endpoint "ingest_clip".
+                vad_path = gr.Textbox(visible=False, label="path potongan")
+                vad_durasi_info = gr.Number(value=None, visible=False,
+                                            label="durasi potongan (detik)")
+                btn_ingest_hidden = gr.Button(visible=False)
+
+                gr.Markdown("#### Antrian transmisi")
+                live_df = gr.Dataframe(headers=LIVE_COLS, value=live_queue_table(),
+                                       interactive=False, wrap=True,
+                                       elem_id="live_queue")
+                gr.Markdown("<span class='muted'>Terbaca dari database, memperbarui diri "
+                            "setiap 2 detik. Transmisi tetap diproses walau panel ditutup.</span>")
+
+                with gr.Accordion("📁 Proses file manual (upload audio lama)", open=False):
+                    gr.Markdown("<span class='muted'>Terpisah dari mode dengar terus. "
+                                "Dipakai hanya bila Anda punya file rekaman yang mau "
+                                "diproses sekali jalan.</span>")
+                    with gr.Row():
+                        with gr.Column(scale=5):
+                            audio_in = gr.Audio(sources=["upload"], type="filepath",
+                                                label="Unggah audio (wav/mp3/m4a/ogg)",
                                                 elem_id="audio_in")
                             with gr.Row():
-                                btn_process = gr.Button("▶ Proses audio", variant="primary", scale=2)
-                                btn_clear = gr.ClearButton([audio_in], value="Bersihkan", scale=1)
-                            gr.Markdown("<span class='muted'>Pemrosesan berjalan di perangkat ini. "
-                                        "File audio identik tidak akan membuat tiket/laporan ganda.</span>")
-                            gr.Markdown(f"<span class='muted'>Perangkat audio input terdeteksi: "
+                                btn_process = gr.Button("▶ Proses audio", variant="secondary",
+                                                        scale=2)
+                                btn_clear = gr.ClearButton([audio_in], value="Bersihkan",
+                                                           scale=1)
+                            gr.Markdown(f"<span class='muted'>Perangkat audio input "
+                                        f"terdeteksi: "
                                         f"{html.escape('; '.join(audio.list_input_devices())[:300])}</span>")
-                        with gr.Accordion("Transkrip manual (uji tanpa audio)", open=False):
-                            txt_in = gr.Textbox(label="Teks laporan",
-                                                placeholder="Contoh: Pos Bravo membutuhkan tambahan 30 liter solar.")
-                            btn_text = gr.Button("Proses teks", size="sm")
-                        with gr.Accordion("Konfigurasi model (lokal)", open=False):
-                            gr.HTML(settings_status(), elem_id="cfg_status_small")
-                    with gr.Column(scale=7):
-                        status_box = gr.Markdown("Siap.")
-                        transcript_box = gr.Textbox(label="Transkripsi (Whisper, bahasa Indonesia)",
-                                                    lines=3, interactive=False)
-                        analysis_box = gr.HTML(analysis_html({}))
-                        with gr.Accordion("JSON mentah AI (audit)", open=False):
-                            json_box = gr.Code(label="JSON", language="json", value="")
+                        with gr.Column(scale=7):
+                            status_box = gr.Markdown("Siap.")
+                            transcript_box = gr.Textbox(
+                                label="Transkripsi (Whisper, bahasa Indonesia)",
+                                lines=3, interactive=False)
+                            analysis_box = gr.HTML(analysis_html({}))
+                            with gr.Accordion("JSON mentah AI (audit)", open=False):
+                                json_box = gr.Code(label="JSON", language="json", value="")
+
+                with gr.Row():
+                    with gr.Accordion("Transkrip manual (uji tanpa audio)", open=False):
+                        txt_in = gr.Textbox(label="Teks laporan",
+                                            placeholder="Contoh: Pos Bravo membutuhkan tambahan 30 liter solar.")
+                        btn_text = gr.Button("Proses teks", size="sm")
+                    with gr.Accordion("Konfigurasi model (lokal)", open=False):
+                        gr.HTML(settings_status(), elem_id="cfg_status_small")
 
                 outputs_common = []  # didefinisikan setelah komponen dibuat di bawah
 
@@ -585,21 +632,6 @@ def build_ui() -> gr.Blocks:
                     btn_refresh_main = gr.Button("🔄 Refresh data", size="sm")
                 sample_msg = gr.Markdown("")
                 demo_result = gr.HTML("")
-
-                gr.Markdown("### Antrian mode dengar terus")
-                with gr.Row():
-                    btn_listen_on = gr.Button("🟢 Mulai dengar terus", variant="primary",
-                                              scale=1)
-                    btn_listen_off = gr.Button("⏹ Hentikan", scale=1)
-                live_status = gr.Markdown("Mode dengar terus: **nonaktif**.")
-                vad_state = gr.Textbox(value="belum", visible=False,
-                                       elem_id="vad_state", label="status VAD")
-                vad_timer = gr.Timer(3.0, active=False)
-                live_df = gr.Dataframe(headers=LIVE_COLS, value=live_queue_table(),
-                                       interactive=False, wrap=True,
-                                       elem_id="live_queue")
-                gr.Markdown("<span class='muted'>Panel ini terbaca dari database "
-                            "dan memperbarui diri setiap 2 detik.</span>")
 
             # ---------------- Tab 2: Dashboard ----------------
             with gr.Tab("📊 Dashboard"):
@@ -712,23 +744,31 @@ def build_ui() -> gr.Blocks:
                               [transcript_box, analysis_box, json_box, status_box, *all_outputs])
             btn_text.click(save_transcript_text, [txt_in], [status_box, *all_outputs])
             btn_refresh_main.click(_refresh_all, None, all_outputs)
-            # Mulai: nyalakan VAD browser (klik "Mulai" = izin mic eksplisit).
+            # Mulai: nyalakan stream mikrofon + VAD (klik "Mulai" = izin mic).
             # JS mengirim status nyata ke hidden textbox supaya kegagalan
             # (izin mic ditolak, WASM gagal dimuat) TIDAK diam-diam.
             btn_listen_on.click(do_start_listening_and_watch, None,
                                 [live_status, vad_timer, vad_state],
-                                js=("() => { window.__GARUDA_SET_LISTENING__?.(true); "
+                                js=("async () => { await window.__GARUDA_SET_LISTENING__?.(true); "
                                     "return window.__GARUDA_VAD_STATUS__ || 'belum'; }"),
                                 concurrency_limit=None, concurrency_id="garuda_listen")
             btn_listen_off.click(do_stop_listening_and_watch, None,
                                  [live_status, vad_timer, vad_state],
-                                 js=("() => { window.__GARUDA_SET_LISTENING__?.(false); "
+                                 js=("async () => { await window.__GARUDA_SET_LISTENING__?.(false); "
                                      "return 'nonaktif'; }"),
                                  concurrency_limit=None, concurrency_id="garuda_listen")
-            vad_timer.tick(vad_report, [vad_state], live_status)
-            # Ingest tidak boleh berbagi antrian default dengan timer/LLM: kalau
-            # tersendat, transmisi berikutnya tidak pernah masuk dan loop mati diam.
-            audio_in.stop_recording(do_ingest_clip, [audio_in], [live_status],
+            # Timer membaca status VAD langsung dari browser lewat js=, lalu
+            # server menerjemahkannya jadi pesan. Ini yang membuat kegagalan
+            # (izin mic, WASM, upload) terlihat operator, bukan diam.
+            vad_timer.tick(vad_report, [vad_state], live_status,
+                           js=("() => (window.__GARUDA_VAD_STATUS__ || 'belum') + '|' "
+                               "+ (window.__GARUDA_VAD_INFO__ || '')"))
+            # Pintu masuk potongan audio dari browser. Skrip VAD memanggil
+            # endpoint ini setiap kali sunyi cukup lama - tanpa klik operator.
+            # Memakai tombol tersembunyi supaya event-nya punya api_name tetap.
+            btn_ingest_hidden.click(do_ingest_clip, [vad_path, vad_durasi_info],
+                                    live_status,
+                                    api_name="ingest_clip",
                                     concurrency_limit=None,
                                     concurrency_id="garuda_ingest")
             live_timer = gr.Timer(2.0, active=True)
@@ -765,90 +805,148 @@ VAD_BOOT_JS = """
 <script src="__VAD_BASE__/ort.min.js" type="text/javascript"></script>
 <script src="__VAD_BASE__/vad-web.bundle.min.js" type="text/javascript"></script>
 <script>
-// GARUDA: deteksi suara (VAD) di browser -> memicu tombol rekam gr.Audio.
+// GARUDA - mode dengar terus.
+//
+// Mikrofon dibuka SEKALI dan streaming terus selama mode aktif. VAD memantau
+// tiap frame; ketika terdeteksi bicara lalu SUNYI __SILENCE_SEC__ detik,
+// potongan audio itu langsung diubah jadi WAV dan dikirim ke server untuk
+// diproses. Tidak ada tombol record/stop, tidak ada tombol "Proses audio".
 //
 // Kedua pustaka adalah skrip UMD (bukan ES module), jadi WAJIB dimuat lewat
 // <script> biasa sebelum skrip ini. Urutan penting:
-//   1. ort.min.js       -> mendefinisikan window.ort (onnxruntime-web)
+//   1. ort.min.js       -> window.ort (onnxruntime-web)
 //   2. vad-web.bundle   -> window.vad = factory(window.ort)
-// Tanpa ort, MicVAD.new gagal dan deteksi otomatis tidak pernah menyala.
 //
 // Aset (silero_vad.onnx, vad.worklet.bundle.min.js, ort-wasm-*.wasm) dicari
 // relatif ke src tag <script> vad-web terakhir, yaitu folder models/vad.
 (function () {
   var BASE = "__VAD_BASE__/";
+  var SILENCE_SEC = __SILENCE_SEC__;
+  var SUBMIT_PATH = "__SUBMIT_PATH__";
   var log = function () { console.log.apply(console, ["[garuda-vad]"].concat([].slice.call(arguments))); };
-  var listening = false;
+  var state = null;   // { vad, unggah }
+  var diproses = 0;
 
-  function recBtn() {
-    return document.querySelector('#audio_in button[aria-label*="ecord"], #audio_in .record-button');
-  }
-  function stopBtn() {
-    return document.querySelector('#audio_in button[aria-label*="top"], #audio_in .stop-button');
-  }
-  function clickSafe(el) { if (el && !el.disabled) el.click(); }
-
-  function waitFor(fn, ms) {
-    return new Promise(function (res, rej) {
-      var t0 = Date.now();
-      (function tick() {
-        var v = fn();
-        if (v) return res(v);
-        if (Date.now() - t0 > ms) return rej(new Error("timeout menunggu tombol rekam"));
-        setTimeout(tick, 250);
-      })();
-    });
-  }
+  // 16000 Hz x 0.096 s per frame; redemptionFrames = berapa frame sunyi
+  // sebelum dianggap selesai bicara.
+  var FRAME_SAMPLES = 1536;
+  var SR = 16000;
+  var REDEMPTION_FRAMES = Math.max(1, Math.round(SILENCE_SEC * SR / FRAME_SAMPLES));
 
   window.__GARUDA_VAD_STATUS__ = "belum";
+  window.__GARUDA_VAD_INFO__ = "";
+
+  // Float32Array 16 kHz -> WAV 16-bit mono -> Blob
+  function keWav(float32) {
+    var n = float32.length;
+    var buf = new ArrayBuffer(44 + n * 2);
+    var v = new DataView(buf);
+    function teks(off, s) { for (var i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i)); }
+    teks(0, "RIFF");
+    v.setUint32(4, 36 + n * 2, true);
+    teks(8, "WAVE");
+    teks(12, "fmt ");
+    v.setUint32(16, 16, true);
+    v.setUint16(20, 1, true);          // PCM
+    v.setUint16(22, 1, true);          // mono
+    v.setUint32(24, SR, true);
+    v.setUint32(28, SR * 2, true);
+    v.setUint16(32, 2, true);
+    v.setUint16(34, 16, true);
+    teks(36, "data");
+    v.setUint32(40, n * 2, true);
+    var off = 44;
+    for (var i = 0; i < n; i++) {
+      var s = Math.max(-1, Math.min(1, float32[i]));
+      v.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+      off += 2;
+    }
+    return new Blob([buf], { type: "audio/wav" });
+  }
+
+  // Kirim satu potongan ke endpoint Gradio. Gradio 6 memakai protokol
+  // upload -> SSE POST -> stream hasil.
+  async function kirim(blob, detik) {
+    var nama = "garuda-" + Date.now() + ".wav";
+    var fd = new FormData();
+    fd.append("files", blob, nama);
+    var up = await fetch("/gradio_api/upload", { method: "POST", body: fd });
+    if (!up.ok) throw new Error("unggah gagal HTTP " + up.status);
+    var daftar = await up.json();
+    var path = daftar && daftar[0];
+    if (!path) throw new Error("server tidak mengembalikan path berkas");
+
+    var r = await fetch(SUBMIT_PATH, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ data: [path, detik] }),
+    });
+    if (!r.ok) throw new Error("kirim gagal HTTP " + r.status);
+    var j = await r.json();
+    if (j && j.error) throw new Error(String(j.error));
+    log("potongan " + detik.toFixed(1) + " s terkirim ke antrian");
+    return j;
+  }
+
+  function setStatus(s) { window.__GARUDA_VAD_STATUS__ = s; }
+  function setInfo(s) { window.__GARUDA_VAD_INFO__ = s; }
 
   window.__GARUDA_SET_LISTENING__ = async function (on) {
     try {
       if (on) {
-        if (listening) { window.__GARUDA_VAD_STATUS__ = "aktif"; return true; }
-        if (typeof window.ort === "undefined") throw new Error("onnxruntime-web (ort.min.js) tidak termuat");
-        if (!window.vad || !window.vad.MicVAD) throw new Error("bundle vad-web tidak termuat");
-        await waitFor(recBtn, 20000);
+        if (state) { setStatus("aktif"); return true; }
+        if (typeof window.ort === "undefined") throw new Error("ort.min.js tidak termuat");
+        if (!window.vad || !window.vad.MicVAD) throw new Error("vad-web.bundle.min.js tidak termuat");
 
-        // Catatan: vad-web 0.0.9 TIDAK punya opsi baseAssetPath/onnxWASMBasePath.
-        // Aset (silero_vad.onnx, worklet) di-resolve dari src tag <script>
-        // vad-web di atas, jadi file itu WAJIB berada di folder models/vad.
-        // Yang bisa diatur hanya lokasi berkas WASM onnxruntime.
+        setStatus("menyiapkan");
         window.ort.env.wasm.wasmPaths = BASE;
-        window.__GARUDA_VAD__ = await window.vad.MicVAD.new({
-          onSpeechStart: function () { clickSafe(recBtn()); },
-          onSpeechEnd: function () { clickSafe(stopBtn()); },
+        var vad = await window.vad.MicVAD.new({
+          redemptionFrames: REDEMPTION_FRAMES,   // sunyi N detik = potong
+          onSpeechStart: function () { setInfo("mendengar suara..."); },
+          onVADMisfire: function () { setInfo("mendengarkan"); },
+          onSpeechEnd: function (audio) {
+            // audio = Float32Array 16 kHz dari pustaka VAD
+            var detik = audio.length / SR;
+            setInfo("memotong transmisi " + detik.toFixed(1) + " s, mengirim...");
+            var blob = keWav(audio);
+            diproses += 1;
+            kirim(blob, detik).then(function () {
+              setInfo("mendengarkan (" + diproses + " transmisi terkirim)");
+            }).catch(function (e) {
+              console.error("[garuda-vad] kirim gagal:", e);
+              setInfo("GAGAL mengirim: " + String(e).slice(0, 120));
+              setStatus("gagal: kirim: " + String(e).slice(0, 120));
+            });
+          },
         });
-        await window.__GARUDA_VAD__.start();
-        listening = true;
-        window.__GARUDA_VAD_STATUS__ = "aktif";
-        log("aktif - mendengarkan suara");
+        await vad.start();
+        state = { vad: vad, unggah: true };
+        setStatus("aktif");
+        setInfo("mendengarkan");
+        log("aktif - sunyi " + SILENCE_SEC + " s (" + REDEMPTION_FRAMES + " frame) -> potong & proses");
       } else {
-        // Hentikan deteksi DAN lepaskan mikrofon, supaya Start berikutnya
-        // tidak menumpuk stream audio.
-        // Catatan: v.listening adalah boolean, jadi JANGAN dipakai untuk
-        // mengambil stream - v.stream yang berisi MediaStream.
-        var v = window.__GARUDA_VAD__;
-        if (v) {
-          try { v.pause(); } catch (e) {}
-          try { if (v.stream && v.stream.getTracks) v.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+        var s = state;
+        state = null;
+        if (s) {
+          try { s.vad.pause(); } catch (e) {}
+          try { if (s.vad.stream && s.vad.stream.getTracks) s.vad.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
           try {
-            if (v.audioNodeVAD && v.audioNodeVAD.entryNode && v.audioNodeVAD.entryNode.disconnect) {
-              v.audioNodeVAD.entryNode.disconnect();
+            if (s.vad.audioNodeVAD && s.vad.audioNodeVAD.entryNode && s.vad.audioNodeVAD.entryNode.disconnect) {
+              s.vad.audioNodeVAD.entryNode.disconnect();
             }
           } catch (e) {}
-          try { if (v.audioContext && v.audioContext.close) v.audioContext.close(); } catch (e) {}
-          window.__GARUDA_VAD__ = null;
+          try { if (s.vad.audioContext && s.vad.audioContext.close) s.vad.audioContext.close(); } catch (e) {}
         }
-        listening = false;
-        window.__GARUDA_VAD_STATUS__ = "nonaktif";
+        setStatus("nonaktif");
+        setInfo("mikrofon dilepas");
         log("nonaktif - mikrofon dilepas");
       }
       return true;
     } catch (e) {
       console.error("[garuda-vad] gagal:", e);
       window.__GARUDA_VAD_ERROR__ = String(e);
-      window.__GARUDA_VAD_STATUS__ = "gagal: " + String(e);
+      setStatus("gagal: " + String(e));
+      setInfo("gagal: " + String(e));
       return false;
     }
   };
@@ -858,14 +956,19 @@ VAD_BOOT_JS = """
 """
 
 
+
 def launch():  # pragma: no cover
     db.init_db()
     port = int(os.environ.get("GARUDA_PORT", "7860"))
     demo = build_ui()
     demo.queue(default_concurrency_limit=2)
     vad_base = "/gradio_api/file=" + config.VAD_DIR.as_posix()
-    head = (VAD_BOOT_JS.replace("__VAD_BASE__", vad_base)
-            if config.vad_assets_ready() else "")
+    head = ""
+    if config.vad_assets_ready():
+        head = (VAD_BOOT_JS
+                .replace("__VAD_BASE__", vad_base)
+                .replace("__SILENCE_SEC__", f"{config.SILENCE_SECONDS:g}")
+                .replace("__SUBMIT_PATH__", "/gradio_api/call/ingest_clip"))
     print(f"GARUDA Radio AI siap di http://127.0.0.1:{port}")
     if not head:
         print("Catatan: aset VAD belum ada - deteksi suara otomatis nonaktif. "

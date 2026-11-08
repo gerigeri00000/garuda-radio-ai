@@ -134,24 +134,46 @@ bila hanya membaca kode — katakan terus terang bahwa belum dijalankan.
 
 ## 7b. Mode dengar terus (continuous listening)
 
-Alur: VAD browser (`models/vad/`) memicu tombol rekam `gr.Audio` → tiap klip
-masuk `loop.enqueue_clip()` → satu thread pekerja memanggil
-`pipeline.process_audio(..., auto_apply=True)` → panel UI membaca `db.loop_feed()`.
+Alur: **satu stream mikrofon** yang tetap terbuka selama mode aktif → VAD memotong
+satu transmisi setelah sunyi `config.SILENCE_SECONDS` (3 s) → browser mengubah
+`Float32Array` jadi WAV → `POST /gradio_api/upload` → `POST /gradio_api/call/ingest_clip`
+dengan `data: [path, durasi]` → `app.do_ingest_clip()` → `loop.enqueue_clip()` → satu
+thread pekerja memanggil `pipeline.process_audio(..., auto_apply=True)` → panel UI
+membaca `db.loop_feed()`.
+
+**Operator hanya menekan Mulai sekali.** Tidak ada tombol record/stop, tidak ada
+"Proses audio" di jalur ini. `gr.Audio` untuk mikrofon sudah **dihapus** dari UI;
+`audio_in` hanya `sources=["upload"]` untuk file lama, di dalam Accordion terpisah.
+Jangan pernah kembali ke pola "VAD mengklik tombol rekam Gradio" — pola itu membuat
+tombol berkedip, threshold sunyi tidak bisa diatur, dan terasa masih manual.
 
 **Aturan yang tidak boleh dilanggar:**
 - `config.AUTO_APPLY_ACTIONS = {"CREATE_ALERT"}` — **hanya** alert yang langsung berlaku.
   `CREATE_TICKET` tetap `Pending`, `UPDATE_MAP` tetap `Pending Approval`,
   `UPDATE_STATUS` tetap usulan. Jangan tambah entri tanpa persetujuan manusia.
+  `UPDATE_STATUS` sengaja tidak di-auto-apply: `_match_activity` memakai ambang
+  kemiripan 0.7, terlalu lemah untuk menutup tiket otomatis.
 - `auto_apply` default `False` di semua fungsi. Jalur manual tidak boleh berubah.
 - Panel antrian dibaca dari DB, bukan dari state memori di `loop.py`.
+- `do_ingest_clip()` **wajib** menolak klip bila `_LISTENING` belum diset. Endpoint ini
+  terbuka lewat HTTP; tanpa penjagaan itu siapa pun bisa memicu alert otomatis.
+  Ia juga **wajib** memvalidasi path (harus berkas nyata berekstensi audio) dan
+  memakai durasi kiriman browser bila ada, karena WAV dibuat di sisi klien.
 - Aset VAD diunduh **hanya** lewat `setup_models.py vad`, tidak pernah saat runtime.
-  Tanpa aset, mode tetap menyala tapi tanpa deteksi otomatis (rekam manual).
+  Tanpa aset, mode tetap menyala tapi tanpa deteksi otomatis; operator masih bisa
+  memakai panel upload manual.
 
 **Perintah terkait:**
 ```powershell
-.\.venv\Scripts\python.exe setup_models.py vad   # unduh aset VAD (butuh internet, sekali)
-.\.venv\Scripts\python.exe test_live.py          # 24 pemeriksaan mode dengar terus
+.\.venv\Scripts\python.exe setup_models.py vad        # unduh aset VAD (butuh internet, sekali)
+.\.venv\Scripts\python.exe test_live.py               # 29 pemeriksaan mode dengar terus
+.\.venv\Scripts\python.exe test_ingest_endpoint.py    # 13 pemeriksaan protokol browser->server
 ```
+
+`test_ingest_endpoint.py` menyalakan server Gradio sungguhan lalu meniru persis dua
+panggilan HTTP browser (upload + `call/ingest_clip`, termasuk pembacaan SSE). Uji ini
+yang membuktikan potongan audio benar-benar sampai ke antrian — tanpa itu, deteksi
+suara sebaik apa pun tidak akan pernah memproses apa pun.
 
 **Hal-hal yang mudah dirusak saat mengubah `loop.py`:**
 - `stop_worker()` memakai `threading.Event` per-thread, **bukan** sentinel `None` di
@@ -162,7 +184,7 @@ masuk `loop.enqueue_clip()` → satu thread pekerja memanggil
   Start berikutnya tidak menciptakan worker kedua.
 - Setiap klip yang dipotong karena antrian penuh **wajib** dicatat `discarded`
   ke `events_log`; kalau tidak, operator kehilangan jejak transmisi yang hilang.
-- `stop_recording` dan tombol Mulai/Hentikan memakai `concurrency_id` terpisah
+- `ingest_clip` dan tombol Mulai/Hentikan memakai `concurrency_id` terpisah
   (`garuda_ingest`, `garuda_listen`). Jangan biarkan ingest berbagi antrian default
   dengan timer/LLM — kalau tersendat, loop mati diam-diam.
 - `loop_feed()` membaca 4x lebih banyak baris daripada yang ditampilkan saat
@@ -176,15 +198,25 @@ masuk `loop.enqueue_clip()` → satu thread pekerja memanggil
   menghasilkan `MicVAD`; ia hanya ada sebagai `window.vad` setelah `<script>`.
 - **`ort.min.js` wajib dimuat lebih dulu.** Tanpa `window.ort`, `window.vad` tidak
   pernah terbentuk dan deteksi otomatis mati tanpa pesan. Urutan benar:
-  `ort.min.js` → `vad-web.bundle.min.js` → skrip GARUDA.
+  `ort.min.js` → `vad-web.bundle.min.js` → skrip GARUDA. Ketiganya dimuat lewat
+  `launch(head=...)`, **bukan** `gr.HTML` — Gradio menyaring `<script>` di `gr.HTML`.
 - v0.0.9 **tidak punya** opsi `baseAssetPath`/`onnxWASMBasePath`. Aset
   (`silero_vad.onnx`, `vad.worklet.bundle.min.js`) dicari relatif ke `src` tag
-  `<script>` vad-web, jadi kelima aset **harus** berada di `models/vad/`.
+  `<script>` vad-web, jadi keenam aset **harus** berada di `models/vad/`.
 - Hanya `ort.env.wasm.wasmPaths` yang bisa diarahkan manual.
+- **Sunyi 3 detik diatur lewat `redemptionFrames`, bukan konstanta detik.** Pustaka
+  memakai `frameSamples: 1536` pada 16 kHz, jadi satu frame = 0,096 s dan
+  `redemptionFrames` dihitung `round(SILENCE_SECONDS * 16000 / 1536)` = 31 frame
+  (2,98 s). Default pustaka hanya 8 frame (~0,77 s). Jangan ganti `frameSamples`
+  tanpa menghitung ulang; pustaka hanya menerima 512/1024/1536.
+- `onSpeechEnd(audio)` menerima **`Float32Array` 16 kHz**, bukan Blob/file. `keWav()`
+  yang mengubahnya jadi WAV 16-bit mono. `detik = audio.length / 16000` dikirim
+  bersama path supaya server tidak perlu memprobe ulang.
 - VAD baru menyala setelah operator menekan **Mulai** (`js=` pada `click`),
   karena membuka mikrofon memerlukan izin eksplisit pengguna. `js=` mengembalikan
-  `__GARUDA_VAD_STATUS__` ke `vad_state`, lalu `vad_report()` menampilkan
-  kegagalan (izin ditolak / WASM gagal / worklet gagal) ke `live_status`.
+  `"status|info"` ke `vad_state`, lalu `vad_report()` menampilkannya ke `live_status`
+  lewat `vad_timer.tick(..., js=...)` yang membaca `__GARUDA_VAD_STATUS__` /
+  `__GARUDA_VAD_INFO__` setiap 2 detik.
   **Jangan hapus jalur pelaporan ini** — tanpa itu operator melihat "AKTIF"
   padahal tidak ada suara yang pernah terdeteksi.
 - Saat Hentikan, ambil `v.stream` untuk `getTracks().stop()`.
@@ -193,10 +225,13 @@ masuk `loop.enqueue_clip()` → satu thread pekerja memanggil
 - `ort-wasm-simd.wasm` ikut diunduh sebagai cadangan untuk halaman tanpa
   cross-origin isolation (tanpa `SharedArrayBuffer`).
 
-**Belum terverifikasi:** deteksi suara sungguhan di browser (butuh mic manusia).
-Yang sudah terbukti: rantai `ort.min.js` → `vad-web.bundle.min.js` menghasilkan
-`window.vad.MicVAD` berupa fungsi, kelima aset HTTP 200, halaman memuat skrip
-VAD, dan alur klip → antrian → aksi lewat handler langsung.
+**Belum terverifikasi:** deteksi suara sungguhan di browser (butuh mic manusia) dan
+apakah `redemptionFrames: 31` memotong transmisi pada jeda bicara normal — jeda
+napas >3 s akan memecah satu kalimat jadi dua klip. Yang sudah terbukti: rantai
+`ort.min.js` → `vad-web.bundle.min.js` menghasilkan `window.vad.MicVAD` berupa
+fungsi, keenam aset HTTP 200, substitusi skrip benar, `audio_in` hanya `upload`,
+nol handler `stop_recording`, dan protokol browser→antrian lulus 13/13
+(`test_ingest_endpoint.py`).
 
 ---
 
