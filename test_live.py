@@ -301,6 +301,46 @@ def test_status_vad_jujur():
             and check("belum menyala diperingatkan", "belum" in diam.lower(), diam[:70]))
 
 
+def test_js_tombol_mengembalikan_list():
+    """`js=` pada event Gradio HARUS mengembalikan LIST sepanjang `outputs`.
+
+    Bug nyata (2025-10-26): `js=` mengembalikan satu string. Gradio 6
+    memperlakukan nilai itu sebagai objek MASUKAN lalu gagal dengan
+    "Parameter `0` is not a valid keyword argument". Akibatnya klik
+    "Mulai dengar terus" tidak pernah menjalankan fungsi server: status
+    tetap nonaktif dan UI hanya menampilkan "Error".
+
+    Uji statis ini menjaga agar tidak ada `js=` yang kembali ke pola itu.
+    """
+    import re
+    sumber = Path(__file__).with_name("app.py").read_text(encoding="utf-8")
+    # Ambil setiap nilai js=( ... ) sampai penutup kurung yang sepadan.
+    pola = re.compile(r"js=\((.*?)\)\s*,", re.S)
+    bermasalah = []
+    for m in pola.finditer(sumber):
+        potongan = m.group(1)
+        if "return" not in potongan:
+            continue
+        if "return [" not in potongan:
+            baris = sumber[: m.start()].count("\n") + 1
+            bermasalah.append(f"baris {baris}: {potongan.strip()[:70]}")
+    return check("semua js= mengembalikan list (bukan nilai tunggal)",
+                 not bermasalah, "; ".join(bermasalah)[:200])
+
+
+def test_tombol_mulai_tidak_mengembalikan_komponen():
+    """Fungsi klik tidak boleh mengembalikan objek komponen Gradio.
+
+    Mengembalikan `gr.Textbox(...)` dari fungsi event membuat Gradio
+    memperlakukannya sebagai argumen kata kunci, yang juga menggagalkan klik.
+    """
+    import app
+    hasil = app.do_start_listening_and_watch()
+    harfiah = hasil[-1]
+    return check("status VAD dikembalikan sebagai string",
+                 isinstance(harfiah, str), type(harfiah).__name__)
+
+
 def test_gerbang_sunyi_di_browser():
     """Jalankan uji gerbang sunyi memakai BUNDLE VAD ASLI (node).
 
@@ -654,6 +694,8 @@ def run() -> int:
                test_ingest_tolak_path_bukan_audio,
                test_ingest_tolak_berkas_di_luar_unggahan,
                test_status_vad_jujur,
+               test_js_tombol_mengembalikan_list,
+               test_tombol_mulai_tidak_mengembalikan_komponen,
                test_gerbang_sunyi_di_browser,
                test_feed_menampilkan_kategori_dan_aksi,
                test_feed_tahan_detail_json_rusak, test_stop_worker_tidak_hang_saat_antrian_penuh,

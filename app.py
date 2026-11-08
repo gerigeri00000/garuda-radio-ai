@@ -266,13 +266,20 @@ def do_start_listening():
 
 
 def do_start_listening_and_watch():
-    """Mulai mode + nyalakan pemantau status VAD."""
-    return do_start_listening(), gr.Timer(2.0, active=True), gr.Textbox(value="menyiapkan|")
+    """Mulai mode + nyalakan pemantau status VAD.
+
+    Nilai balik harus NILAI BIASA (string / Update), bukan objek komponen
+    Gradio: mengembalikan `gr.Textbox(...)` membuat Gradio memperlakukannya
+    sebagai argumen kata kunci dan klik tombol langsung gagal dengan
+    "Parameter `0` is not a valid keyword argument" - tombol Mulai jadi
+    tidak bereaksi sama sekali.
+    """
+    return do_start_listening(), gr.Timer(2.0, active=True), "menyiapkan|"
 
 
 def do_stop_listening_and_watch():
     """Hentikan mode + matikan pemantau status VAD."""
-    return do_stop_listening(), gr.Timer(2.0, active=False), gr.Textbox(value="nonaktif|")
+    return do_stop_listening(), gr.Timer(2.0, active=False), "nonaktif|"
 
 
 def do_stop_listening():
@@ -620,7 +627,7 @@ def build_ui() -> gr.Blocks:
                     btn_listen_on = gr.Button("🟢 Mulai dengar terus", variant="primary",
                                               scale=1)
                     btn_listen_off = gr.Button("⏹ Hentikan", scale=1)
-                live_status = gr.Markdown("Status: **nonaktif**.")
+                live_status = gr.Markdown("Status: **nonaktif**.", elem_id="live_status")
                 # Satu kotak tersembunyi berisi "status|info" dari skrip VAD.
                 vad_state = gr.Textbox(value="belum|", visible=False,
                                        elem_id="vad_state", label="status VAD")
@@ -797,15 +804,20 @@ def build_ui() -> gr.Blocks:
             # Mulai: nyalakan stream mikrofon + VAD (klik "Mulai" = izin mic).
             # JS mengirim status nyata ke hidden textbox supaya kegagalan
             # (izin mic ditolak, WASM gagal dimuat) TIDAK diam-diam.
+            # `js=` WAJIB mengembalikan LIST sepanjang `outputs`, bukan satu
+            # nilai. Kalau hanya satu string, Gradio menganggapnya objek
+            # masukan dan klik gagal dengan
+            # "Parameter `0` is not a valid keyword argument".
             btn_listen_on.click(do_start_listening_and_watch, None,
                                 [live_status, vad_timer, vad_state],
                                 js=("async () => { await window.__GARUDA_SET_LISTENING__?.(true); "
-                                    "return window.__GARUDA_VAD_STATUS__ || 'belum'; }"),
+                                    "const s = window.__GARUDA_VAD_STATUS__ || 'belum'; "
+                                    "return [null, null, s + '|' + (window.__GARUDA_VAD_INFO__ || '')]; }"),
                                 concurrency_limit=None, concurrency_id="garuda_listen")
             btn_listen_off.click(do_stop_listening_and_watch, None,
                                  [live_status, vad_timer, vad_state],
                                  js=("async () => { await window.__GARUDA_SET_LISTENING__?.(false); "
-                                     "return 'nonaktif'; }"),
+                                     "return [null, null, 'nonaktif|']; }"),
                                  concurrency_limit=None, concurrency_id="garuda_listen")
             # Timer membaca status VAD langsung dari browser lewat js=, lalu
             # server menerjemahkannya jadi pesan. Ini yang membuat kegagalan

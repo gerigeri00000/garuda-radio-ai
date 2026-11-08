@@ -170,7 +170,7 @@ tombol berkedip, threshold sunyi tidak bisa diatur, dan terasa masih manual.
 **Perintah terkait:**
 ```powershell
 .\.venv\Scripts\python.exe setup_models.py vad        # unduh aset VAD (butuh internet, sekali)
-.\.venv\Scripts\python.exe test_live.py               # 30 pemeriksaan mode dengar terus
+.\.venv\Scripts\python.exe test_live.py               # 32 pemeriksaan mode dengar terus
 .\.venv\Scripts\python.exe test_ingest_endpoint.py    # 13 pemeriksaan protokol browser->server
 node test_vad_gerbang.js                              # 14 pemeriksaan gerbang sunyi (dipanggil test_live.py)
 ```
@@ -248,6 +248,17 @@ Dua uji ini menutup dua celah berbeda:
   `__GARUDA_VAD_INFO__` setiap 2 detik.
   **Jangan hapus jalur pelaporan ini** — tanpa itu operator melihat "AKTIF"
   padahal tidak ada suara yang pernah terdeteksi.
+- **`js=` WAJIB mengembalikan LIST sepanjang `outputs`** (atau `Update`), bukan
+  satu nilai. Fungsi event juga tidak boleh mengembalikan objek komponen
+  (`gr.Textbox(...)`) — kembalikan nilainya saja.
+  Bug nyata: `js=` mengembalikan satu string, Gradio 6 memperlakukannya sebagai
+  objek **masukan**, klik gagal dengan `Parameter \`0\` is not a valid keyword
+  argument`, fungsi server tidak pernah jalan, dan operator hanya melihat status
+  "nonaktif" + tulisan "Error" tanpa penjelasan apa pun. Dijaga oleh
+  `test_js_tombol_mengembalikan_list` dan
+  `test_tombol_mulai_tidak_mengembalikan_komponen` (uji statis, tidak butuh browser).
+- `live_status` memakai `elem_id="live_status"` supaya bisa diperiksa otomatis
+  dari browser (dipakai uji klik tombol sungguhan).
 - `kirim()` **wajib** membaca SSE hasil (`bacaHasil`). Tanpa itu, penolakan server
   (mis. mode sudah nonaktif) tidak pernah terlihat dan UI berbohong "terkirim".
 - Saat Hentikan, ambil `v.stream` untuk `getTracks().stop()`.
