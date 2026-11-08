@@ -1,0 +1,10 @@
+# Model & data runtime TIDAK dilacak git (ukuran besar, bisa dibuat ulang)
+models/
+data/
+samples/
+__pycache__/
+*.pyc
+.venv/
+
+# Cadangan manual
+*.bak

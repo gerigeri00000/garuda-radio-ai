@@ -1,0 +1,23 @@
+# GARUDA Radio AI - dependensi runtime
+# Python 3.11 / 3.12 (dites di 3.12.4, Windows 11)
+#
+# llama-cpp-python TIDAK dipin di sini karena wheel GPU harus dari index khusus;
+# setup.bat memasangnya dari https://abetlen.github.io/llama-cpp-python/whl/cu124
+
+gradio==6.31.0
+faster-whisper==1.2.1
+av==15.1.0                # av>=14 dibutuhkan faster-whisper; 15.1.0 stabil
+ctranslate2>=4.5,<5
+soundfile>=0.12
+numpy>=1.24,<2
+pydantic>=2.5
+reportlab>=4.0
+folium>=0.15
+huggingface_hub>=0.27     # hanya dipakai setup_models.py (unduh model saat setup)
+piper-tts==1.8.0          # suara sintetis Indonesia (offline) untuk sample demo
+sherpa-onnx==1.13.4       # dipakai piper-tts; 2.x merusak fonemisasi VITS Indonesia
+onnxruntime>=1.17         # backend inferensi TTS Piper
+pillow>=10
+
+# Opsional (perangkat radio / sound card server):
+#   sounddevice
