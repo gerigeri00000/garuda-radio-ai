@@ -954,6 +954,8 @@ def build_ui() -> gr.Blocks:
                               [transcript_box, analysis_box, json_box, status_box, *all_outputs])
             btn_text.click(save_transcript_text, [txt_in], [status_box, *all_outputs])
             btn_refresh_main.click(_refresh_all, None, all_outputs)
+            # Refresh browser harus membaca DB, bukan nilai saat server mulai.
+            demo.load(_refresh_all, None, all_outputs)
             # Mulai: nyalakan stream mikrofon + VAD (klik "Mulai" = izin mic).
             # JS mengirim status nyata ke hidden textbox supaya kegagalan
             # (izin mic ditolak, WASM gagal dimuat) TIDAK diam-diam.
