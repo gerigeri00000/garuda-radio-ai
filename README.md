@@ -31,9 +31,40 @@ Dibuat untuk lomba **Kartika TNI AD**.
 ## Prasyarat
 
 - Windows 11, **Python 3.11 atau 3.12** (diuji 3.12.4)
-- GPU NVIDIA opsional (target uji: RTX 4050 Laptop 6 GB). CPU jalan, lebih lambat.
+- RAM **minimal 8 GB**, disarankan 16 GB
+- Disk **minimal 10 GB** kosong (model + `.venv` ± 5–6 GB)
+- GPU NVIDIA **opsional** — tanpa GPU aplikasi tetap jalan, hanya lebih lambat
 - Node.js hanya untuk `test_vad_gerbang.js` (opsional)
 - Internet **hanya saat setup** untuk mengunduh dependensi + model
+
+## Rekomendasi spesifikasi laptop
+
+RTX 4050 Laptop 6 GB yang disebut di bagian **Performa** adalah **laptop pengujian
+pengembang**, bukan syarat minimum. Aplikasi berjalan tanpa GPU sama sekali.
+
+| Komponen | Minimum (jalan, lambat) | Rekomendasi | Ideal (demo lomba) |
+|---|---|---|---|
+| CPU | 4 core (i5 gen-8 / Ryzen 5 2500U) | 6–8 core (i5-12450H / Ryzen 5 7535HS) | 8 core+ (i7-13700H / Ryzen 7 7840HS) |
+| RAM | 8 GB | 16 GB | 32 GB |
+| GPU | tidak wajib (iGPU) | NVIDIA **6 GB VRAM** (RTX 3050 6 GB / RTX 4050) | NVIDIA **8 GB+** (RTX 4060 / 4070) |
+| Disk | 10 GB kosong, SSD | 20 GB kosong, NVMe | 30 GB kosong, NVMe |
+| Driver | – | NVIDIA driver ≥ 550 (CUDA 12.4, wheel `cu124`) | sama |
+
+Perkiraan kebutuhan VRAM (dari ukuran model di `models/`):
+
+| Beban | Perkiraan VRAM |
+|---|---|
+| Qwen2.5 3B Q4_K_M, ctx 4096 | ± 2,0 GB bobot + ± 0,2 GB KV cache |
+| Qwen2.5 1.5B Q4_K_M | ± 1,1 GB bobot + KV cache |
+| Whisper `small` (int8) | ± 0,5 GB |
+| Whisper `large-v3-turbo` (fp16) | ± 1,6–2,0 GB |
+
+Jadi 6 GB VRAM cukup untuk LLM 3B **dan** Whisper sekaligus. GPU 4 GB masih jalan
+dengan `llm_gpu_layers` sebagian (mis. 20–24) atau Whisper di CPU. GPU AMD/Intel
+jatuh ke jalur CPU — `llama-cpp-python` dan `ctranslate2` di sini build CUDA.
+
+Tanpa GPU: pilih Qwen2.5 **1.5B** di tab Pengaturan (analisis ±7–10 s); 3B tetap
+jalan tapi ±15–20 s per transmisi.
 
 ## Instalasi
 
@@ -183,7 +214,10 @@ Status uji terakhir di mesin pengembangan: `test_scenarios.py` 47/47 PASS,
 
 ## Performa
 
-Diukur pada mesin pengembangan (RTX 4050 6 GB), transkripsi CPU + LLM build **CPU**:
+Diukur pada **laptop pengujian pengembang** (Lenovo, Ryzen 7 7735HS, 16 GB RAM,
+RTX 4050 Laptop 6 GB), transkripsi CPU + LLM build **CPU**. Angka ini bukan
+patokan mesin lain — tanpa GPU hasilnya di kisaran yang sama, dengan GPU bisa
+jauh lebih cepat.
 
 | Tahap | Model | Waktu terukur |
 |---|---|---|

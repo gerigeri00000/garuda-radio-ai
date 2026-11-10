@@ -46,7 +46,7 @@ if errorlevel 1 ( echo [ERROR] Gagal memasang dependensi. & pause & exit /b 1 )
 
 echo.
 echo   --- llama-cpp-python ---
-echo   Build CUDA (disarankan, RTX 4050 = CUDA 12.4/12.5):
+echo   Build CUDA (disarankan bila ada GPU NVIDIA; cu124 butuh driver >= 550):
 "%VPY%" -m pip install llama-cpp-python==0.3.36 --only-binary=:all: ^
     --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
 if errorlevel 1 (
