@@ -1,8 +1,11 @@
 # GARUDA Radio AI - dependensi runtime
-# Python 3.11 / 3.12 (dites di 3.12.4, Windows 11)
+# Python 3.11 / 3.12 (dites di 3.12.4 Windows 11; 3.11.15 & 3.12.13 macOS M4 Pro)
 #
 # llama-cpp-python TIDAK dipin di sini karena wheel GPU harus dari index khusus;
 # setup.bat memasangnya dari https://abetlen.github.io/llama-cpp-python/whl/cu124
+#
+# macOS Apple Silicon: setup.sh memasang file ini + requirements-mac.txt (MLX,
+# Whisper di GPU) dan membangun llama-cpp-python dengan Metal.
 
 gradio==6.31.0
 faster-whisper==1.2.1
@@ -13,7 +16,7 @@ numpy>=1.24,<2
 pydantic>=2.5
 reportlab>=4.0
 folium>=0.15
-huggingface_hub>=0.27     # hanya dipakai setup_models.py (unduh model saat setup)
+huggingface_hub>=0.27     # unduh model di setup_models.py (juga di-import mlx-whisper di Mac)
 piper-tts==1.8.0          # suara sintetis Indonesia (offline) untuk sample demo
 sherpa-onnx==1.13.4       # dipakai piper-tts; 2.x merusak fonemisasi VITS Indonesia
 onnxruntime>=1.17         # backend inferensi TTS Piper

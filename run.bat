@@ -16,7 +16,7 @@ REM Pastikan model ada (cek lokal, tidak mengunduh apa pun)
 "%VPY%" setup_models.py status
 if errorlevel 1 (
     echo.
-    echo [PERHATIAN] Model Whisper small / LLM 3B belum lengkap.
+    echo [PERHATIAN] Model aktif Whisper / LLM belum lengkap - lihat baris 'aktif' di atas.
     echo             Aplikasi tetap terbuka, tetapi transkripsi/analisis akan menolak
     echo             dengan pesan jelas. Unduh lewat setup.bat saat ada internet.
     echo.

@@ -3,13 +3,15 @@
 > **Baca file ini dulu (≈2 menit), bukan README.md dari baris 0.**
 > README.md = dokumentasi untuk manusia. File ini = konteks ringkas untuk agent.
 > Path proyek: `D:\Project\Python\TniWhisper\garuda-radio-ai` (Windows, PowerShell).
+> Juga berjalan di **macOS Apple Silicon** (setup.sh/run.sh) — lihat §7c.
 
 ---
 
 ## 1. Apa proyek ini
 
 **GARUDA Radio AI** — app desktop lokal & offline: audio radio → **faster-whisper**
-(transkripsi ID) → **Qwen2.5 1.5B/3B GGUF via llama.cpp** → JSON terstruktur →
+(atau **mlx-whisper** di GPU Mac Apple Silicon) (transkripsi ID) →
+**Qwen2.5 1.5B/3B GGUF via llama.cpp** (CUDA / Metal / CPU) → JSON terstruktur →
 **validasi Python** → aksi otomatis ke SQLite → UI Gradio (5 tab).
 
 **Batasan yang tidak boleh dilanggar (aturan produk, bukan preferensi):**
@@ -26,9 +28,9 @@
 
 | File | Isi | Kapan disentuh |
 |---|---|---|
-| `config.py` | path, model, `DEMO_LOCATIONS`, `DEFAULTS`, `load/save_config`, `device_info()` | ubah lokasi/model/default |
+| `config.py` | path, model, `DEMO_LOCATIONS`, `DEFAULTS`, `load/save_config`, `device_info()`, deteksi platform (`IS_APPLE_SILICON`, `perf_cores()`, `SETUP_CMD`, `VENV_PY`) | ubah lokasi/model/default |
 | `database.py` | skema SQLite 8 tabel + semua query (`db.*`), `_LOCK = RLock` | ubah skema/query |
-| `audio.py` | konversi ke 16 kHz mono + faster-whisper | ubah transkripsi |
+| `audio.py` | konversi ke 16 kHz mono + `whisper_backend()` memilih faster-whisper atau mlx-whisper (Mac), cadangan CPU bila MLX gagal, `warmup()` | ubah transkripsi |
 | `ai.py` | prompt, `CATEGORIES/PRIORITIES/ACTIONS`, `analyze()`, `validate()`, `rule_based()`, `AnalysisResult` | ubah prompt/output LLM |
 | `actions.py` | action engine: `process_audio_result()`, anti-duplikasi tiket/map, tulis ke DB | ubah aturan aksi |
 | `pipeline.py` | `process_audio()` / `process_text()` — **satu-satunya jalur** dipakai UI & test | entry baru |
@@ -36,13 +38,15 @@
 | `map_view.py` | Folium + fallback SVG offline | ubah peta |
 | `reports.py` | rekap + ekspor CSV/PDF | ubah rekap |
 | `app.py` | UI Gradio satu halaman `build_ui()` (5 tab), handler `do_*`, `_refresh_all()` | ubah UI |
-| `setup_models.py` | unduh & cek model (`status`, `whisper-small`, `llm-3b`, `tts-id`) | ubah model |
+| `setup_models.py` | unduh & cek model (`status`, `whisper-small`, `whisper-mlx-<size>`, `llm-3b`, `tts-id`, `vad`) | ubah model |
 | `samples_gen.py` | generator audio TTS Piper offline + data demo | ubah sampel |
 | `test_scenarios.py` | 47 pemeriksaan end-to-end (audio TTS nyata, reset DB) | verifikasi |
+| `test_platform.py` | 42 pemeriksaan tanpa model unduhan: pemilihan mesin Whisper + cadangan CPU, mode JSON cepat, pengaman template, fd/berkas sementara, config, MLX lintas thread | verifikasi |
 | `smoke_ui.py` | uji server UI HTTP 200 | verifikasi |
+| `setup.sh` / `run.sh` / `requirements-mac.txt` | padanan setup.bat/run.bat untuk macOS (MLX + Metal) | ubah instalasi Mac |
 
 Data runtime: `data/garuda.db`, `data/audio/`, `data/exports/`, `data/config.json`.
-Model: `models/whisper/<size>/`, `models/llm/*.gguf`, `models/tts/`. **Jangan commit/hapus isi `models/`.**
+Model: `models/whisper/<size>/`, `models/whisper-mlx/<size>/` (Mac), `models/llm/*.gguf`, `models/tts/`. **Jangan commit/hapus isi `models/`.**
 
 ---
 
@@ -98,6 +102,17 @@ DB berisi data demo — aman di-reset lewat `test_scenarios.py`.
 .\.venv\Scripts\python.exe setup_models.py status
 .\.venv\Scripts\python.exe test_scenarios.py     # reset DB + 47 pemeriksaan (baseline: 47/47 PASS)
 .\.venv\Scripts\python.exe smoke_ui.py           # baseline: SMOKE PASS (HTTP 200)
+.\.venv\Scripts\python.exe test_platform.py      # 42 pemeriksaan tanpa model unduhan (cepat)
+```
+
+macOS (Apple Silicon):
+
+```bash
+./setup.sh                                       # venv + MLX + llama.cpp Metal + model (±4,3 GB)
+./run.sh                                         # http://127.0.0.1:7860 (offline, caffeinate)
+.venv/bin/python setup_models.py status
+.venv/bin/python test_scenarios.py               # baseline Mac mini M4 Pro: 47/47 PASS
+.venv/bin/python test_platform.py                # baseline: 42/42 PASS
 ```
 
 Tanpa `.venv`/model, uji end-to-end tidak bisa jalan. Jangan mengaku "terverifikasi"
@@ -312,6 +327,83 @@ mikrofon dilepas saat Hentikan, dan klik ganda tidak membuka dua stream.
 Rantai `ort.min.js` → `vad-web.bundle.min.js` menghasilkan `window.vad.MicVAD`
 berupa fungsi, keenam aset HTTP 200, substitusi skrip benar, `audio_in` hanya
 `upload`, nol handler `stop_recording`, dan protokol browser→antrian lulus 13/13.
+
+---
+
+## 7c. macOS Apple Silicon (MLX + Metal)
+
+Prinsip: **default Windows tidak berubah.** Perilaku khusus Mac dipilih lewat
+`config.IS_APPLE_SILICON` (arm64 asli, bukan Rosetta) atau ketersediaan bobot MLX.
+Yang SENGAJA berlaku di semua platform (perbaikan, belum diuji di Windows):
+`ai.echoes_template()` + penetral NaN/Infinity di `validate()`, `ai._INFER_LOCK`,
+kode keluar `setup_models.py status` (mengikuti model aktif → peringatan run.bat kini
+muncul), fd/WAV sementara di `audio.to_wav16k()` ditutup & dihapus, `save_config()`
+hanya menyimpan nilai yang diubah, `load_config()` menormalkan `whisper_device` yang tidak
+berlaku di platform ini ke `auto`, label mesin Whisper di UI.
+
+- **Whisper**: `audio.whisper_backend(cfg)` memilih `mlx` bila perangkat `auto`/`mlx`,
+  paket mlx-whisper + Metal ada, dan bobot `models/whisper-mlx/<size>/` terpasang;
+  selain itu faster-whisper (jalur asli). `_resolve_device()` tidak pernah meneruskan
+  `mlx` ke CTranslate2. Bila model hanya ada versi MLX tetapi MLX tidak dipakai
+  (perangkat `cpu`, MLX/Metal tak bisa dimuat), `whisper_backend()` langsung memilih
+  `_cpu_fallback_model()` (model sama atau `small`) — **pemanggil wajib memakai `be["name"]`**,
+  bukan `cfg["whisper_model"]`. Bila MLX gagal saat jalan → cadangan yang sama, label
+  "(cadangan: mlx gagal)". Transkrip tidak boleh hilang.
+- **MLX = satu thread khusus** (`audio._on_mlx_thread`, executor 1 pekerja "garuda-mlx").
+  MLX 0.32 memakai stream GPU per thread: array lazy dari thread A yang dievaluasi di
+  thread B gagal "There is no Stream(gpu, N) in current thread" (bug nyata: klip sunyi
+  pertama memuat model tanpa inferensi → semua klip berikutnya dari thread lain gagal).
+  `_mlx_load()` juga `mx.eval(model.state)`. Jangan panggil MLX di luar `_on_mlx_thread`.
+  Dijaga `test_platform.py` bagian 6 (model MLX mini acak).
+- `audio.release_models()` melepas model (dipanggil `save_settings`, lalu pemanasan ulang).
+- mlx-whisper **tidak punya beam search** (greedy + fallback temperatur). VAD-nya memakai
+  `faster_whisper.vad` dengan `VAD_PARAMS` yang sama supaya sunyi tidak ditranskripsi
+  persis seperti `vad_filter=True`. `INITIAL_PROMPT` dipakai bersama kedua mesin.
+- `transcribe_seconds` = waktu inferensi saja (muat model & antre thread MLX di luar
+  timer), sama seperti asli. Hasil `transcribe()` tidak lagi memuat key `wav` (berkas
+  sementaranya dihapus; tidak ada pemakai).
+- `config.DEFAULTS["whisper_model"]` = `large-v3-turbo` bila bobot MLX turbo + paket
+  mlx-whisper ada di Apple Silicon (WER = kata salah, makin kecil makin baik: 4,9 % vs
+  8,4 % small; ±0,5 s/klip), selain itu `small`.
+- **LLM**: `ai._llama_kwargs()` → `n_threads = perf_cores()` (P-core; E-core memperlambat)
+  dan `flash_attn=True` hanya di Apple Silicon. Windows: nilai asli.
+- **`llm_fast_json`** (default hanya Apple Silicon): generate tanpa grammar dulu
+  (stop pada `TEMPLATE_MARK`), grammar JSON hanya bila keluaran bukan objek JSON.
+  Grammar llama-cpp-python memindai seluruh ±152 rb token kosakata Qwen tiap langkah
+  → ±2× lebih lambat (diukur 41,7 vs 84 tok/s). Belum diuji di Windows; boleh dinyalakan
+  di `data/config.json` setelah `test_scenarios.py` lulus di sana.
+- **`ai.echoes_template()`** (semua platform): Qwen 3B kadang **menyalin template skema**
+  `SYSTEM_PROMPT` untuk transkrip ambigu (`"unit": "Pos Alfa atau null"`, `"quantity": 10`).
+  JSON-nya valid, sehingga dulu bisa menjadi tiket karangan (10 + "barang atau kegiatan
+  atau null") dan lokasi karangan (Pos Alfa). Kini `validate()` menolaknya → klasifikasi
+  aturan + perlu verifikasi. Dijaga `test_platform.py`. Jangan dihapus.
+- **`warmup`** (default hanya Apple Silicon): `pipeline.warmup()` di thread latar saat
+  `app.launch()` dan setelah `save_settings` — muat Whisper + LLM, kompilasi kernel, cache
+  prompt sistem. Tanpa DB.
+- `ai._INFER_LOCK`: satu objek Llama dipakai UI manual + pekerja mode dengar terus. Jangan dihapus.
+- **fd**: `audio._temp_wav()` menutup fd `mkstemp`. Dulu tiap klip membocorkan satu fd;
+  Terminal macOS punya batas lunak 256 → mode dengar terus mati setelah ±250 klip.
+  `run.sh` juga menaikkan `ulimit -n` ke 4096.
+
+Jebakan instalasi Mac (sudah ditangani `setup.sh`):
+- Wheel Metal resmi `llama-cpp-python 0.3.36` di index abetlen **rusak** (`Bad CRC-32`);
+  `uv pip` bahkan menolak zip-nya. setup.sh membangun dari source:
+  `CMAKE_ARGS="-DGGML_METAL=on" pip install --no-binary llama-cpp-python` (±1 menit, butuh
+  Xcode CLT), dengan `--no-deps` supaya numpy tidak ter-upgrade ke 2.x.
+- `mlx-whisper` mewajibkan torch di metadata (±600 MB) padahal tidak di-import saat
+  transkripsi → dipasang `--no-deps` + `requirements-mac.txt`.
+- `requirements-mac.txt` **wajib** mengulang `numpy<2`: dipasang di proses pip terpisah,
+  dan di Python 3.12 scipy 1.18 (butuh numpy 2) akan diam-diam meng-upgrade numpy.
+- MLX 0.32 hanya punya wheel macOS 14+ → di macOS 13 langkah MLX dilewati (tidak fatal),
+  model MLX tidak diunduh, transkripsi memakai CPU.
+- Python 3.13+ tidak didukung (numpy<2 tidak punya wheel) → setup.sh menolak venv selain
+  3.11/3.12; di Apple Silicon juga wajib arm64 (Homebrew `/opt/homebrew` didahulukan,
+  `GARUDA_PYTHON` untuk memilih). Dijalankan lewat Rosetta → skrip `exec arch -arm64` ulang.
+- TTS Piper (espeak-ng) gagal bila path `.venv/.../piper/espeak-ng-data` > ±160 karakter
+  (fallback ke path mesin build `/Users/runner/...`). Simpan proyek di path pendek atau set
+  `ESPEAK_DATA_PATH` ke folder `piper/` lewat symlink pendek.
+- Qwen2.5 7B sudah dicoba di M4 Pro: lebih lambat dan `test_scenarios.py` 46/47
+  (genset rusak → INFRASTRUCTURE). Prompt di-tune untuk 3B; jangan jadikan default.
 
 ---
 

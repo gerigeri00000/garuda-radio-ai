@@ -30,10 +30,15 @@ Dibuat untuk lomba **Kartika TNI AD**.
 
 ## Prasyarat
 
-- Windows 11, **Python 3.11 atau 3.12** (diuji 3.12.4)
+- **Windows 11** atau **macOS dengan Apple Silicon (M1–M4)**, **Python 3.11 atau 3.12**
+  (diuji 3.12.4 di Windows, 3.12.13 di Mac mini M4 Pro)
 - RAM **minimal 8 GB**, disarankan 16 GB
 - Disk **minimal 10 GB** kosong (model + `.venv` ± 5–6 GB)
-- GPU NVIDIA **opsional** — tanpa GPU aplikasi tetap jalan, hanya lebih lambat
+- GPU NVIDIA **opsional** — tanpa GPU aplikasi tetap jalan, hanya lebih lambat.
+  Di Mac Apple Silicon, GPU terintegrasi dipakai otomatis (MLX + Metal).
+- macOS: Xcode Command Line Tools (`xcode-select --install`) untuk membangun
+  llama.cpp dengan Metal; Homebrew disarankan (`brew install python@3.12 ffmpeg`).
+  Whisper di GPU (MLX) butuh **macOS 14+**; di macOS 13 transkripsi otomatis memakai CPU.
 - Node.js hanya untuk `test_vad_gerbang.js` (opsional)
 - Internet **hanya saat setup** untuk mengunduh dependensi + model
 
@@ -91,12 +96,64 @@ Unduh model manual (kapan saja, saat online):
 Model **tidak pernah** diunduh diam-diam saat `run.bat`. Bila belum ada, UI menolak
 dengan pesan jelas dan transkrip yang berhasil tetap disimpan sebagai belum terklasifikasi.
 
+### macOS (Apple Silicon M1–M4)
+
+```bash
+./setup.sh
+./run.sh
+```
+
+`setup.sh` akan:
+1. membuat `.venv` dengan Python 3.12/3.11 **arm64** (Homebrew dulu, lalu PATH, atau lewat
+   `uv` bila ada; pilih sendiri dengan `GARUDA_PYTHON=/path/ke/python3.12 ./setup.sh`),
+2. memasang `requirements.txt` + `requirements-mac.txt` + `mlx-whisper` (Whisper di GPU
+   Apple lewat MLX; dipasang tanpa torch karena torch tidak dipakai saat transkripsi),
+3. membangun `llama-cpp-python` 0.3.36 dengan **Metal** dari source (±1 menit di M4 Pro;
+   wheel Metal siap pakai untuk versi ini di index resmi rusak),
+4. menanyakan unduhan model: Whisper `large-v3-turbo` (MLX) + `small` (cadangan CPU) +
+   Qwen2.5 3B + TTS Piper + aset VAD ≈ 4,3 GB (tanpa MLX: model CPU saja ≈ 2,7 GB),
+5. menampilkan status model aktif.
+
+Unduh model manual: `.venv/bin/python setup_models.py whisper-mlx-large-v3-turbo whisper-small llm-3b tts-id vad`
+(`whisper-mlx-small` tersedia bila ingin transkripsi paling cepat).
+
+`run.sh` = padanan `run.bat` (mode offline), ditambah `caffeinate -i` supaya Mac
+tidak tidur selama mode dengar terus berjalan (`GARUDA_NO_CAFFEINATE=1` untuk mematikan),
+dan batas berkas terbuka dinaikkan ke 4096 (bawaan Terminal macOS hanya 256).
+
+Yang otomatis berbeda di Apple Silicon (default di Windows tetap seperti semula):
+- **Whisper di GPU (MLX)** bila bobot MLX ada. Bila MLX tidak bisa dipakai (perangkat
+  `cpu`, macOS lama, atau MLX gagal saat jalan), otomatis memakai faster-whisper `small`
+  di CPU sehingga transkrip tidak hilang. Perangkat dipilih di tab Pengaturan
+  (`auto` / `mlx` / `cpu`).
+- **LLM di GPU (Metal)**: thread CPU = jumlah core performa (P-core), flash attention.
+- **Mode JSON cepat**: LLM menjawab tanpa grammar lebih dulu; grammar JSON hanya
+  dipakai bila jawaban bukan JSON valid (perilaku asli). Grammar llama.cpp memeriksa
+  seluruh ±152 rb token kosakata Qwen setiap langkah, sehingga ±2× lebih lambat.
+- **Pemanasan model** saat aplikasi mulai dan setelah pengaturan disimpan (di latar
+  belakang), sehingga transmisi pertama secepat transmisi berikutnya.
+
+Perubahan yang **juga berlaku di Windows** (perbaikan; belum diuji di Windows):
+- Keluaran LLM yang menyalin template skema (mis. `"unit": "Pos Alfa atau null"`,
+  `"quantity": 10`) ditolak dan diganti klasifikasi aturan + *perlu verifikasi* —
+  sebelumnya bisa menjadi tiket/lokasi karangan. Nilai `NaN`/`Infinity` juga dinetralkan.
+- Inferensi LLM diserialkan (satu model dipakai UI manual dan mode dengar terus).
+- `setup_models.py status` kini mengembalikan kode keluar sesuai model **aktif**, jadi
+  peringatan `run.bat`/`run.sh` benar-benar muncul bila model yang dipakai belum ada.
+- Berkas WAV sementara ditutup & dihapus setelah transkripsi (dulu fd bocor per klip).
+- Panel transkripsi & tab Pengaturan menampilkan mesin Whisper yang aktif.
+
+Catatan macOS: browser (Chrome/Safari) perlu izin mikrofon di *System Settings →
+Privacy & Security → Microphone* untuk mode dengar terus. Bila Terminal berjalan lewat
+Rosetta, `setup.sh` menjalankan ulang dirinya sebagai arm64 (GPU tidak bisa dipakai
+lewat Rosetta).
+
 ## Struktur file
 
 ```text
 garuda-radio-ai/
 ├── app.py                 UI Gradio satu halaman (5 tab) + skrip VAD browser
-├── audio.py               konversi audio 16 kHz mono + faster-whisper
+├── audio.py               konversi audio 16 kHz mono + faster-whisper / mlx-whisper (Mac)
 ├── ai.py                  prompt klasifikasi + validasi JSON (Pydantic)
 ├── actions.py             action engine + aturan persetujuan + anti-duplikasi
 ├── pipeline.py            process_audio() / process_text(): satu jalur UI & test
@@ -114,8 +171,9 @@ garuda-radio-ai/
 ├── test_alert_refresh.py  regresi: refresh halaman baca DB, bukan snapshot
 ├── smoke_ui.py            uji cepat server UI (HTTP 200)
 ├── docs/superpowers/      spesifikasi & rencana desain
-├── setup.bat / run.bat
-├── models/                whisper/<size>/, llm/*.gguf, tts/, vad/   (tidak dilacak git)
+├── setup.bat / run.bat    Windows
+├── setup.sh / run.sh      macOS (+ requirements-mac.txt)
+├── models/                whisper/<size>/, whisper-mlx/<size>/, llm/*.gguf, tts/, vad/   (tidak dilacak git)
 ├── data/                  garuda.db, audio/, exports/              (tidak dilacak git)
 └── samples/               audio simulasi hasil TTS                 (tidak dilacak git)
 ```
@@ -126,7 +184,7 @@ garuda-radio-ai/
 Mikrofon browser (VAD) / upload file / rekaman radio  (wav, mp3, m4a, ogg, webm)
         │  audio.py: konversi ke 16 kHz mono
         ▼
-faster-whisper (lokal, VAD, bahasa Indonesia)
+faster-whisper / mlx-whisper di Mac (lokal, VAD, bahasa Indonesia)
         ▼
 LLM lokal (Qwen2.5 1.5B/3B GGUF, JSON mode)
         ▼
@@ -178,7 +236,8 @@ Lokasi hanya boleh dipilih dari daftar DEMO; lokasi di luar daftar → `null` +
    pilih baris → tombol aksi sesuai status (setujui, tolak, proses, selesai, hapus).
 3. **🗺 Peta (DEMO DATA)** — marker pos/fasilitas/infrastruktur + status; alert ditandai.
 4. **📑 Rekap** — buat rekap per kategori, kronologi penting, ekspor **CSV** dan **PDF**.
-5. **⚙ Pengaturan** — model Whisper (small / large-v3-turbo) & LLM, device, GPU layers, status GPU.
+5. **⚙ Pengaturan** — model Whisper (small / large-v3-turbo) & LLM, device
+   (`auto`/`cuda`/`cpu`; di Mac `auto`/`mlx`/`cpu`), GPU layers, status GPU & mesin aktif.
 
 ## Mode dengar terus
 
@@ -200,7 +259,10 @@ Lokasi hanya boleh dipilih dari daftar DEMO; lokasi di luar daftar → `null` +
 .venv\Scripts\python.exe test_alert_refresh.py    REM regresi refresh alert
 node test_vad_gerbang.js                          REM gerbang sunyi VAD di browser
 .venv\Scripts\python.exe smoke_ui.py              REM server UI: HTTP 200 + judul
+.venv\Scripts\python.exe test_platform.py         REM pemilihan mesin, mode JSON cepat (tanpa model)
 ```
+
+macOS: perintah yang sama dengan `.venv/bin/python` (mis. `.venv/bin/python test_scenarios.py`).
 
 `test_scenarios.py` menguji **audio TTS lokal sungguhan** (bukan mock): logistik,
 peralatan, penyelesaian kegiatan, medis, infrastruktur, suara berisik, dan
@@ -211,6 +273,12 @@ Di UI: tombol **"Buat contoh audio"** lalu **"Uji semua 6 skenario"**.
 
 Status uji terakhir di mesin pengembangan: `test_scenarios.py` 47/47 PASS,
 `smoke_ui.py` SMOKE PASS (HTTP 200), `test_alert_refresh.py` PASS.
+
+Status uji di **Mac mini M4 Pro** (macOS, Python 3.12.13, Whisper large-v3-turbo MLX +
+Qwen2.5 3B Metal): `test_scenarios.py` 47/47, `test_live.py` 32/32,
+`test_ingest_endpoint.py` 13/13, `test_vad_gerbang.js` 14/14, `test_platform.py` 42/42,
+`test_alert_refresh.py` PASS, `smoke_ui.py` SMOKE PASS — juga dari instalasi bersih
+`./setup.sh` (Python 3.11).
 
 ## Performa
 
@@ -232,6 +300,27 @@ lebih dulu; bila gagal, dipasang build CPU agar aplikasi tetap berfungsi. Build 
 terpasang sekarang mendukung offload GPU (`llama_supports_gpu_offload() == True`,
 CUDA terdeteksi). Dengan `n_gpu_layers=-1`, analisis Qwen2.5 3B diperkirakan orde
 1–3 s (angka GPU **belum** diukur formal).
+
+### Mac mini M4 Pro (12-core CPU: 8 P + 4 E, RAM 24 GB)
+
+Diukur per transmisi (audio skenario ±5–8 s, berkas identik untuk semua konfigurasi;
+median kondisi hangat, transkripsi + analisis Qwen2.5 3B Q4_K_M):
+
+| Konfigurasi | Transkripsi | Analisis | Total |
+|---|---|---|---|
+| Kode asli (faster-whisper `small` CPU 4 thread, grammar JSON) | 1,43 s | 2,53 s | 3,85 s |
+| **Default Mac**: `large-v3-turbo` MLX (GPU) + JSON cepat | 0,55 s | 1,28 s | **1,83 s** |
+| `small` MLX (GPU) + JSON cepat (paling cepat) | 0,21 s | 1,37 s | 1,59 s |
+
+Kesalahan transkripsi (WER = persentase kata salah terhadap naskah skenario TTS,
+**makin kecil makin baik**): `small` 8,1–8,4 %, `large-v3-turbo` MLX **4,9 %**
+(±95 % kata benar). Transmisi pertama setelah aplikasi dibuka ±2,0 s (kode asli 5,8 s)
+karena model dipanaskan di latar belakang.
+
+Catatan pengukuran di M4 Pro: grammar JSON llama.cpp memakan ±setengah waktu analisis
+(41,7 vs 84 token/s), sedangkan parameter lain (thread P-core, flash attention, batch)
+hanya berpengaruh ±5 %. Qwen2.5 7B juga dicoba: lebih lambat (±2,5–3,7 s) dan
+`test_scenarios.py` turun ke 46/47, jadi tidak dijadikan pilihan.
 
 ## Privasi & batasan
 

@@ -32,6 +32,7 @@ def process_audio(path: str | Path, cfg: dict, source: str = "upload",
         "duration": round(trans.get("duration") or 0.0, 2),
         "avg_logprob": trans.get("avg_logprob"),
         "transcribe_seconds": trans.get("transcribe_seconds"),
+        "whisper_backend": trans.get("backend"),
         "analysis": None,
         "ai_error": None,
         "action": None,
@@ -77,3 +78,16 @@ def process_text(text: str, cfg: dict) -> dict:
         out["action"] = actions.process_text_result(text, analysis, cfg)
     out["total_seconds"] = round(time.perf_counter() - t0, 2)
     return out
+
+
+def warmup(cfg: dict) -> dict:
+    """Muat Whisper & LLM lebih awal (dipanggil di thread latar saat app mulai).
+
+    Transmisi pertama jadi secepat transmisi berikutnya: bobot model sudah di
+    memori, kernel GPU sudah terkompilasi, dan prompt sistem LLM sudah ada di
+    cache KV. Tidak menyentuh database dan tidak pernah raise.
+    """
+    t0 = time.perf_counter()
+    whisper = audio.warmup(cfg)
+    llm = ai.warmup(cfg)
+    return {"whisper": whisper, "llm": llm, "seconds": round(time.perf_counter() - t0, 2)}

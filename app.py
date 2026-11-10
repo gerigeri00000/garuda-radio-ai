@@ -30,6 +30,11 @@ import samples_gen
 cfg = config.load_config()
 _PROC_LOCK = threading.Lock()
 
+# Pilihan perangkat Whisper: Mac Apple Silicon memakai GPU lewat MLX (tanpa CUDA).
+_DEVICE_CHOICES = list(config.WHISPER_DEVICES)
+_MODEL_ARGS =("whisper-mlx-large-v3-turbo whisper-small llm-3b" if config.IS_APPLE_SILICON
+               else "whisper-small llm-3b")
+
 CATEGORY_LABELS = {
     "LOGISTICS": "Logistik", "MEDICAL": "Medis", "EQUIPMENT": "Peralatan",
     "INFRASTRUCTURE": "Infrastruktur", "STATUS_UPDATE": "Pembaruan Status",
@@ -158,8 +163,10 @@ def analysis_html(res: dict) -> str:
     trans = res.get("transcript", "")
     an = res.get("analysis") or {}
     act = res.get("action") or {}
+    mesin = res.get("whisper_backend")
+    mesin = f"{html.escape(str(mesin))} &middot; " if mesin else ""
     head = (f"<div class='panel'><b>Transkripsi</b> <span class='muted'>"
-            f"({res.get('transcribe_seconds')}s &middot; audio {res.get('duration')}s &middot; "
+            f"({mesin}{res.get('transcribe_seconds')}s &middot; audio {res.get('duration')}s &middot; "
             f"avg_logprob {res.get('avg_logprob')})</span>"
             f"<div style='font-size:15px;margin-top:6px'>{html.escape(trans) or '<i>(kosong)</i>'}</div></div>")
 
@@ -259,7 +266,7 @@ def do_start_listening():
     if not config.vad_assets_ready():
         return ("Mode dengar terus: **AKTIF (tanpa deteksi otomatis)** — aset VAD "
                 "belum ada, jadi mikrofon TIDAK akan dipotong otomatis. Jalankan: "
-                "`.venv\\Scripts\\python.exe setup_models.py vad` lalu muat ulang "
+                f"`{config.VENV_PY} setup_models.py vad` lalu muat ulang "
                 "halaman. Sementara itu pakai panel 'Proses file manual'.")
     return ("Status: **MENDENGARKAN** — mikrofon streaming. Setiap transmisi "
             f"dipotong setelah sunyi {config.SILENCE_SECONDS:.0f} detik dan "
@@ -704,20 +711,43 @@ def save_settings(whisper_model, device, llm_model, gpu_layers, ctx):
         "llm_ctx": int(ctx),
     })
     config.save_config(cfg)
-    audio._WHISPER.clear()
+    audio.release_models()
     ai._LLM.clear()
+    if cfg.get("warmup"):
+        # Model baru dimuat di latar belakang, seperti saat aplikasi mulai.
+        threading.Thread(target=pipeline.warmup, args=(dict(cfg),),
+                         name="garuda-warmup", daemon=True).start()
     return settings_status()
+
+
+def _whisper_status() -> str:
+    try:
+        return audio.whisper_backend(cfg)["label"]
+    except Exception as exc:  # mis. ctranslate2 rusak: UI tetap harus bisa dibuka
+        ada = "ada" if config.whisper_installed(cfg["whisper_model"]) else "BELUM"
+        return f"{cfg['whisper_model']} ({ada}) · mesin tidak bisa diperiksa: {exc}"
 
 
 def settings_status() -> str:
     info = config.device_info()
-    rows = [
-        ("GPU terdeteksi", info["gpu"] or "-"),
-        ("CUDA Whisper (ctranslate2)", "Ya" if info["cuda"] else "Tidak"),
-        ("llama-cpp-python", "Terpasang" if info["llama_cpp"] else "BELUM (jalankan setup.bat)"),
-        ("llama.cpp GPU offload", "Ya" if info["llama_cpp_gpu"] else "Tidak (mode CPU)"),
-        ("Whisper aktif", f"{cfg['whisper_model']} ({'ada' if config.whisper_installed(cfg['whisper_model']) else 'BELUM'})"),
-        ("LLM aktif", f"{cfg['llm_model']} ({'ada' if config.llm_installed(cfg['llm_model']) else 'BELUM'})"),
+    rows = [("GPU terdeteksi", info["gpu"] or "-")]
+    if info["apple_silicon"]:
+        rows += [
+            # mlx_available() benar-benar meng-import mlx-whisper (alasan gagal ke log).
+            ("MLX Whisper (GPU Apple)", "Ya" if audio.mlx_available()
+             else f"Tidak (lihat log terminal / jalankan {config.SETUP_CMD})"),
+            ("Thread CPU inferensi", f"{info['perf_cores'] or '-'} (core performa)"),
+        ]
+    else:
+        rows.append(("CUDA Whisper (ctranslate2)", "Ya" if info["cuda"] else "Tidak"))
+    gpu_llm = "Ya (Metal)" if info["apple_silicon"] else "Ya"
+    llm_mode = " · JSON cepat" if cfg.get("llm_fast_json") else ""
+    rows += [
+        ("llama-cpp-python", "Terpasang" if info["llama_cpp"] else f"BELUM (jalankan {config.SETUP_CMD})"),
+        ("llama.cpp GPU offload", gpu_llm if info["llama_cpp_gpu"] else "Tidak (mode CPU)"),
+        ("Whisper aktif", _whisper_status()),
+        ("LLM aktif", f"{cfg['llm_model']} ({'ada' if config.llm_installed(cfg['llm_model']) else 'BELUM'})"
+                      f"{llm_mode}"),
         ("Database", str(config.DB_PATH)),
         ("Offline", "Tidak ada API cloud yang dipakai"),
     ]
@@ -926,8 +956,11 @@ def build_ui() -> gr.Blocks:
                 with gr.Row():
                     set_whisper = gr.Dropdown(list(config.WHISPER_MODELS),
                                               value=cfg["whisper_model"], label="Model Whisper")
-                    set_device = gr.Dropdown(["auto", "cuda", "cpu"], value=cfg["whisper_device"],
-                                             label="Perangkat Whisper")
+                    set_device = gr.Dropdown(
+                        _DEVICE_CHOICES,
+                        value=cfg["whisper_device"] if cfg["whisper_device"] in _DEVICE_CHOICES else "auto",
+                        label=("Perangkat Whisper (mlx = GPU Apple)" if config.IS_APPLE_SILICON
+                               else "Perangkat Whisper"))
                     set_llm = gr.Dropdown(list(config.LLM_MODELS), value=cfg["llm_model"],
                                           label="Model LLM (GGUF)")
                 with gr.Row():
@@ -935,8 +968,8 @@ def build_ui() -> gr.Blocks:
                     set_ctx = gr.Number(value=cfg["llm_ctx"], label="Konteks LLM", precision=0)
                     btn_save_cfg = gr.Button("Simpan pengaturan", variant="primary")
                 cfg_msg = gr.Markdown("")
-                gr.Markdown("""<span class='muted'>Model tidak diunduh otomatis. Jalankan
-                `setup.bat` (atau `python setup_models.py whisper-small llm-3b`) saat online,
+                gr.Markdown(f"""<span class='muted'>Model tidak diunduh otomatis. Jalankan
+                `{config.SETUP_CMD}` (atau `{config.VENV_PY} setup_models.py {_MODEL_ARGS}`) saat online,
                 setelah itu aplikasi berjalan 100% offline.</span>""")
 
             # ---------------- wiring ----------------
@@ -1370,7 +1403,11 @@ def launch():  # pragma: no cover
     print(f"GARUDA Radio AI siap di http://127.0.0.1:{port}")
     if not head:
         print("Catatan: aset VAD belum ada - deteksi suara otomatis nonaktif. "
-              "Jalankan: setup_models.py vad")
+              f"Jalankan: {config.VENV_PY} setup_models.py vad")
+    if cfg.get("warmup"):
+        # Muat model di latar belakang; UI tetap langsung bisa dibuka.
+        threading.Thread(target=lambda: print(f"Pemanasan model: {pipeline.warmup(cfg)}", flush=True),
+                         name="garuda-warmup", daemon=True).start()
     demo.launch(server_name="127.0.0.1", server_port=port, inbrowser=True,
                 footer_links=[], ssr_mode=False, theme=gr.themes.Soft(), css=CSS,
                 js="", head=head,
