@@ -14,6 +14,7 @@ Lapisan keamanan (penting untuk model kecil):
 from __future__ import annotations
 
 import json
+import math
 import re
 import threading
 import time
@@ -38,6 +39,9 @@ class AnalysisResult(dict):
 
 _LLM = {}
 _LLM_LOCK = threading.Lock()
+# Satu objek Llama tidak aman dipakai dua thread sekaligus (UI manual + pekerja
+# mode dengar terus berbagi model yang sama), jadi inferensi diserialkan.
+_INFER_LOCK = threading.Lock()
 
 SYSTEM_PROMPT = """Anda adalah asisten analisis komunikasi radio operasional berbahasa Indonesia.
 Tugas: ubah satu transkrip laporan radio menjadi SATU objek JSON.
@@ -121,58 +125,133 @@ def _clean_json(text: str) -> str | None:
     return text[start:end + 1]
 
 
+def _install_hint() -> str:
+    if config.IS_APPLE_SILICON:
+        return ("Untuk Metal (Apple Silicon): CMAKE_ARGS=\"-DGGML_METAL=on\" "
+                f"{config.VENV_PY} -m pip install --no-binary llama-cpp-python "
+                "llama-cpp-python==0.3.36\n")
+    return ("Untuk CUDA: pip install llama-cpp-python --only-binary=:all: "
+            "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124\n")
+
+
+def _llama_kwargs(cfg: dict) -> dict:
+    kw = {
+        "n_ctx": int(cfg.get("llm_ctx", 4096)),
+        "n_gpu_layers": int(cfg.get("llm_gpu_layers", -1)),
+        # Mac: jumlah P-core (E-core memperlambat); platform lain: nilai asli.
+        "n_threads": config.llm_threads(),
+        "verbose": False,
+    }
+    if config.IS_APPLE_SILICON:
+        # Metal: flash attention sedikit lebih cepat & hemat memori KV cache.
+        kw["flash_attn"] = True
+    return kw
+
+
 def get_llm(cfg: dict):
     name = cfg.get("llm_model", "qwen2.5-3b-instruct-q4_k_m")
     path = config.model_path(name, "llm")
     if not config.llm_installed(name):
         raise LLMNotAvailable(
             f"Model LLM '{name}' belum terinstal di {path}.\n"
-            "Jalankan:  setup.bat\n"
-            "(setup.bat mengunduh model ke folder models/ - aplikasi tidak mengunduh otomatis)"
+            f"Jalankan:  {config.SETUP_CMD}\n"
+            f"({config.SETUP_CMD} mengunduh model ke folder models/ - aplikasi tidak mengunduh otomatis)"
         )
     try:
         from llama_cpp import Llama
     except Exception as exc:
         raise LLMNotAvailable(
-            "llama-cpp-python belum terpasang. Jalankan setup.bat.\n"
-            "Untuk CUDA: pip install llama-cpp-python --only-binary=:all: "
-            "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124\n"
-            f"Detail: {exc}"
+            f"llama-cpp-python belum terpasang. Jalankan {config.SETUP_CMD}.\n"
+            + _install_hint()
+            + f"Detail: {exc}"
         ) from exc
 
     key = (name, cfg.get("llm_ctx", 4096), cfg.get("llm_gpu_layers", -1))
     with _LLM_LOCK:
         if key in _LLM:
             return _LLM[key]
-        llm = Llama(
-            model_path=str(Path(path)),
-            n_ctx=int(cfg.get("llm_ctx", 4096)),
-            n_gpu_layers=int(cfg.get("llm_gpu_layers", -1)),
-            n_threads=max(2, (os_cpu_count() or 4) - 2),
-            verbose=False,
-        )
+        llm = Llama(model_path=str(Path(path)), **_llama_kwargs(cfg))
         _LLM.clear()
         _LLM[key] = llm
         return llm
 
 
-def os_cpu_count():
-    import os
+def _complete(llm, messages: list[dict], max_tokens: int, response_format,
+              stop: list[str] | None = None) -> str:
+    out = llm.create_chat_completion(
+        messages=messages,
+        temperature=0.1,
+        top_p=0.9,
+        max_tokens=max_tokens,
+        response_format=response_format,
+        stop=stop,
+    )
+    return out["choices"][0]["message"]["content"] or ""
 
-    return os.cpu_count()
+
+# Tanda model kecil sedang menyalin template skema di SYSTEM_PROMPT secara
+# harfiah, mis. `"unit": "Pos Alfa atau null"`, `"quantity": 10 atau null`.
+# Keluaran asli tidak pernah memuat frasa ini. Dipakai (1) sebagai stop di mode
+# cepat supaya percobaan tanpa grammar berhenti dini, (2) di validate().
+TEMPLATE_MARK = "atau null"
+_TEMPLATE_ECHO = [TEMPLATE_MARK]
+
+
+def echoes_template(raw: dict) -> bool:
+    """True bila objek JSON LLM menyalin nilai contoh dari template skema.
+
+    Nilai contoh bukan isi transkrip: "quantity": 10 ikut tersalin sehingga
+    laporan tanpa jumlah bisa menjadi tiket karangan, dan "Pos Alfa atau null"
+    cocok ke lokasi DEMO Pos Alfa. Keluaran seperti ini diperlakukan sebagai
+    LLM gagal (dipakai klasifikasi aturan)."""
+    return any(isinstance(v, str) and TEMPLATE_MARK in v.lower() for v in raw.values())
+
+
+def _reject_constant(name: str):
+    raise ValueError(f"nilai non-JSON: {name}")
+
+
+def _is_json_object(text: str) -> bool:
+    """True bila teks berisi satu objek JSON standar. NaN/Infinity (diterima
+    json.loads tetapi mustahil keluar dari grammar JSON) ditolak -> diulang
+    dengan grammar."""
+    cleaned = _clean_json(text)
+    if not cleaned:
+        return False
+    try:
+        return isinstance(json.loads(cleaned, parse_constant=_reject_constant), dict)
+    except Exception:
+        return False
+
+
+def warmup(cfg: dict) -> str:
+    """Muat LLM + evaluasi prompt sistem sekali, sehingga awalan prompt sudah
+    ada di cache KV saat analisis pertama. Tidak menyentuh DB, tidak raise."""
+    try:
+        llm = get_llm(cfg)
+        with _INFER_LOCK:
+            _complete(llm, [{"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "user", "content": "Transkrip radio:\n\"tes\""}], 1, None)
+        return str(cfg.get("llm_model"))
+    except Exception as exc:
+        return f"gagal: {exc}"
 
 
 def llm_text(prompt: str, system: str, cfg: dict, max_tokens: int = 600,
              json_mode: bool = True) -> str:
     llm = get_llm(cfg)
-    out = llm.create_chat_completion(
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
-        temperature=0.1,
-        top_p=0.9,
-        max_tokens=max_tokens,
-        response_format={"type": "json_object"} if json_mode else None,
-    )
-    return out["choices"][0]["message"]["content"] or ""
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+    with _INFER_LOCK:
+        if json_mode and cfg.get("llm_fast_json"):
+            # Mode cepat: generate tanpa grammar lebih dulu. Grammar JSON llama.cpp
+            # memeriksa seluruh kosakata (±152 rb token Qwen) di setiap langkah,
+            # sehingga ~2x lebih lambat. Bila keluaran bukan objek JSON, ulangi
+            # dengan grammar (perilaku asli) - jadi keandalan tidak turun.
+            text = _complete(llm, messages, max_tokens, None, stop=_TEMPLATE_ECHO)
+            if _is_json_object(text):
+                return text
+        return _complete(llm, messages, max_tokens,
+                         {"type": "json_object"} if json_mode else None)
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +309,8 @@ def validate(raw: dict, source_text: str = "") -> dict:
     """Validasi & normalisasi output LLM. Raise ValueError bila tidak layak."""
     if not isinstance(raw, dict):
         raise ValueError("Output bukan objek JSON")
+    if echoes_template(raw):
+        raise ValueError("Output menyalin template skema (nilai contoh, bukan isi transkrip)")
     src = source_text or ""
     cat = str(raw.get("category", "UNKNOWN")).upper().strip()
     if cat not in CATEGORIES:
@@ -259,9 +340,13 @@ def validate(raw: dict, source_text: str = "") -> dict:
         confidence = float(raw.get("confidence", 0.5))
     except (TypeError, ValueError):
         confidence = 0.5
+    if not math.isfinite(confidence):  # NaN/Infinity: min()/max() tidak menjinakkannya
+        confidence = 0.5
     confidence = max(0.0, min(confidence_cap, confidence))
 
     qty = _to_float(raw.get("quantity"))
+    if qty is not None and not math.isfinite(qty):
+        qty = None  # jumlah tak terhingga bukan jumlah -> tiket tidak dibuat
     unit = raw.get("unit")
     unit = str(unit).strip() if isinstance(unit, str) and unit.strip() and unit.strip().lower() != "null" else None
     item = raw.get("item")

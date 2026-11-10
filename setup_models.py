@@ -1,10 +1,13 @@
 """
 GARUDA Radio AI - staging & verifikasi model lokal.
 
-- `setup.bat` memanggil `python setup_models.py whisper-small llm-3b`.
+- `setup.bat` (Windows) / `setup.sh` (macOS) memanggil
+  `python setup_models.py whisper-small llm-3b ...`.
 - Model diunduh HANYA di setup (dengan konfirmasi operator), tidak saat app.py jalan.
 - Filename & folder mengikuti dokumentasi resmi:
   * Whisper : https://github.com/SYSTRAN/faster-whisper (Systran/faster-whisper-<size>)
+  * Whisper MLX (Apple Silicon): https://github.com/ml-explore/mlx-examples/tree/main/whisper
+    (mlx-community/whisper-<size>)
   * LLM     : https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF
 """
 from __future__ import annotations
@@ -18,6 +21,13 @@ WHISPER_REPOS = {
     "base": "Systran/faster-whisper-base",
     "small": "Systran/faster-whisper-small",
     "large-v3-turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+}
+
+# Bobot MLX komunitas ml-explore (fp16). Hanya dipakai di Apple Silicon.
+WHISPER_MLX_REPOS = {
+    "base": "mlx-community/whisper-base-mlx",
+    "small": "mlx-community/whisper-small-mlx",
+    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
 }
 
 LLM_FILES = {
@@ -80,6 +90,30 @@ def fetch_whisper(size: str) -> None:
     print("OK\n")
 
 
+def fetch_whisper_mlx(size: str) -> None:
+    """Bobot Whisper format MLX untuk GPU Apple Silicon (dipakai audio.py)."""
+    if size not in WHISPER_MLX_REPOS:
+        raise SystemExit(f"Ukuran Whisper MLX tidak dikenal: {size} "
+                         f"(pilihan: {', '.join(WHISPER_MLX_REPOS)})")
+    if not config.IS_APPLE_SILICON:
+        print(f"[whisper-mlx:{size}] dilewati - MLX hanya berjalan di Mac Apple Silicon.\n")
+        return
+    from huggingface_hub import snapshot_download
+
+    repo = WHISPER_MLX_REPOS[size]
+    dest = config.model_path(size, "whisper-mlx")
+    print(f"[whisper-mlx:{size}] {repo} -> {dest}")
+    if config.whisper_mlx_installed(size):
+        print("  sudah ada\n")
+        return
+    dest.mkdir(parents=True, exist_ok=True)
+    snapshot_download(repo_id=repo, local_dir=str(dest),
+                      allow_patterns=["config.json", "weights.safetensors", "weights.npz"])
+    if not config.whisper_mlx_installed(size):
+        raise SystemExit(f"  GAGAL: bobot MLX tidak lengkap di {dest}")
+    print("  OK\n")
+
+
 def fetch_llm(name: str) -> None:
     from pathlib import Path
 
@@ -113,20 +147,41 @@ def fetch_tts() -> None:
     print(f"  selesai -> {TTS_MODEL}\n")
 
 
+def _active_ok() -> bool:
+    """True bila model yang benar-benar dipakai app (Whisper sesuai mesin aktif
+    + LLM terpilih) tersedia. Dipakai sebagai kode keluar `status`, sehingga
+    peringatan run.bat/run.sh akurat untuk instalasi MLX-saja maupun CPU-saja."""
+    try:
+        import audio
+
+        cfg = config.load_config()
+        be = audio.whisper_backend(cfg)
+        llm_ok = config.llm_installed(cfg["llm_model"])
+        print(f"  aktif: whisper {be['label']} | llm {cfg['llm_model']} "
+              f"({'OK' if llm_ok else 'BELUM ADA'})")
+        return be["engine"] is not None and llm_ok
+    except Exception as exc:
+        print(f"  aktif: tidak bisa diperiksa ({exc})")
+        return False
+
+
 def status() -> int:
     print("Status model lokal:")
-    ok = True
     for size in config.WHISPER_MODELS:
         have = config.whisper_installed(size)
-        ok = ok and (have or size != "small")
         print(f"  whisper/{size:16s} : {'OK ' + str(config.model_path(size,'whisper')) if have else 'BELUM ADA'}")
+    if config.IS_APPLE_SILICON:
+        # Opsional: tanpa bobot MLX, transkripsi tetap jalan di CPU (faster-whisper).
+        for size in config.WHISPER_MLX_MODELS:
+            have = config.whisper_mlx_installed(size)
+            print(f"  whisper-mlx/{size:12s} : "
+                  f"{'OK ' + str(config.model_path(size, 'whisper-mlx')) if have else 'BELUM ADA (opsional, GPU Apple)'}")
     for name in config.LLM_MODELS:
         have = config.llm_installed(name)
-        ok = ok and (have or "3b" not in name)
         print(f"  llm/{name:32s} : {'OK ' + str(config.model_path(name,'llm')) if have else 'BELUM ADA'}")
     print(f"  tts/id_ID-news_tts             : {'OK' if TTS_MODEL.exists() else 'BELUM ADA (opsional, untuk audio demo)'}")
     print(f"  vad (browser)                  : {'OK' if config.vad_assets_ready() else 'BELUM ADA (opsional, untuk deteksi suara otomatis)'}")
-    return 0 if ok else 1
+    return 0 if _active_ok() else 1
 
 
 VAD_CDN_ASSETS = [
@@ -181,9 +236,13 @@ def main(argv: list[str]) -> int:
         print(__doc__)
         print("Pemakaian: python setup_models.py whisper-small llm-3b status")
         return 0
+    rc = 0
     for arg in argv:
         if arg == "status":
-            status()
+            # Kode keluar dipakai run.bat/run.sh untuk memberi peringatan model belum lengkap.
+            rc = status() or rc
+        elif arg.startswith("whisper-mlx-"):
+            fetch_whisper_mlx(arg[len("whisper-mlx-"):])
         elif arg.startswith("whisper-"):
             fetch_whisper(arg[len("whisper-"):])
         elif arg.startswith("llm-"):
@@ -194,11 +253,11 @@ def main(argv: list[str]) -> int:
         elif arg == "tts-id":
             fetch_tts()
         elif arg == "vad":
-            return install_vad()
+            rc = install_vad() or rc
         else:
             print(f"Argumen tidak dikenal: {arg}")
             return 2
-    return 0
+    return rc
 
 
 if __name__ == "__main__":

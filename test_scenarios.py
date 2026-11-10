@@ -15,6 +15,7 @@ from pathlib import Path
 
 import actions
 import ai
+import audio
 import config
 import database as db
 import pipeline
@@ -57,9 +58,12 @@ def run() -> int:
     results: list[bool] = []
 
     section("0. Prasyarat model & dependensi")
-    results.append(check("Whisper terinstal (small)", config.whisper_installed("small")))
-    if not config.whisper_installed("small"):
-        print("  Jalankan: python setup_models.py whisper-small")
+    # Model Whisper yang AKTIF (faster-whisper atau MLX di Apple Silicon).
+    whisper_be = audio.whisper_backend(cfg)
+    whisper_ok = whisper_be["engine"] is not None
+    results.append(check(f"Whisper terinstal ({whisper_be['label']})", whisper_ok))
+    if not whisper_ok:
+        print(f"  Jalankan: python setup_models.py whisper-{cfg['whisper_model']}")
     results.append(check("TTS Indonesia terinstal (untuk audio demo)", samples_gen.tts_installed()))
     if not samples_gen.tts_installed():
         print("  Jalankan: python setup_models.py tts-id")
@@ -67,7 +71,7 @@ def run() -> int:
     results.append(check(f"LLM terinstal ({cfg['llm_model']})", llm_ok))
     if not llm_ok:
         print("  Jalankan: python setup_models.py llm-3b")
-    if not (config.whisper_installed("small") and llm_ok):
+    if not (whisper_ok and llm_ok):
         return 1
 
     section("1. Membuat audio simulasi (TTS lokal)")

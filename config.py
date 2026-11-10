@@ -2,12 +2,66 @@
 GARUDA Radio AI - konfigurasi terpusat.
 
 Semua path, model, dan lokasi simulasi ada di sini supaya mudah diubah.
-Tidak ada download model otomatis: model harus disiapkan lewat setup.bat.
+Tidak ada download model otomatis: model harus disiapkan lewat setup.bat
+(Windows) atau setup.sh (macOS).
 """
 from __future__ import annotations
 
 import os
+import platform
+import subprocess
+import sys
+from functools import lru_cache
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Platform. Windows + NVIDIA = jalur asli (CUDA). macOS Apple Silicon memakai
+# GPU terintegrasi lewat MLX (Whisper) dan Metal (llama.cpp).
+# ---------------------------------------------------------------------------
+IS_WINDOWS = os.name == "nt"
+IS_MAC = sys.platform == "darwin"
+# arm64 asli. Python x86_64 lewat Rosetta tidak bisa memakai MLX/Metal.
+IS_APPLE_SILICON = IS_MAC and platform.machine() == "arm64"
+
+# Perintah setup & interpreter venv sesuai platform (dipakai di pesan UI/error).
+SETUP_CMD = "setup.bat" if IS_WINDOWS else "./setup.sh"
+VENV_PY = r".venv\Scripts\python.exe" if IS_WINDOWS else ".venv/bin/python"
+
+
+def _sysctl(key: str) -> str | None:
+    try:
+        out = subprocess.run(["sysctl", "-n", key], capture_output=True, text=True, timeout=5)
+        val = out.stdout.strip()
+        return val if out.returncode == 0 and val else None
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=1)
+def perf_cores() -> int | None:
+    """Jumlah core performa (P-core) Apple Silicon, mis. 8 pada M4 Pro 12-core.
+
+    E-core jauh lebih lambat: thread inferensi yang jatuh ke E-core membuat
+    thread lain menunggu, jadi total lebih lambat. None di luar macOS.
+    """
+    if not IS_MAC:
+        return None
+    try:
+        n = int(_sysctl("hw.perflevel0.physicalcpu") or 0)
+    except ValueError:
+        return None
+    return n if n > 0 else None
+
+
+def whisper_cpu_threads() -> int:
+    """Thread CPU faster-whisper. Di luar macOS tetap 4 (nilai asli yang sudah diuji)."""
+    return perf_cores() or 4
+
+
+def llm_threads() -> int:
+    """Thread CPU llama.cpp. Di luar macOS tetap nilai asli (jumlah core - 2)."""
+    return perf_cores() or max(2, (os.cpu_count() or 4) - 2)
+
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -25,10 +79,18 @@ for _d in (DATA_DIR, AUDIO_DIR, EXPORT_DIR, MODELS_DIR, SAMPLES_DIR):
 # Model (semua lokal, tidak ada API cloud)
 # ---------------------------------------------------------------------------
 WHISPER_MODELS = {
-    # nama  ->  folder lokal di models/whisper/<nama>
+    # nama  ->  folder lokal di models/whisper/<nama>  (format CTranslate2, faster-whisper)
     "base": "models/whisper/base",
     "small": "models/whisper/small",
     "large-v3-turbo": "models/whisper/large-v3-turbo",
+}
+
+# Bobot format MLX (GPU Apple Silicon). Nama sama dengan WHISPER_MODELS supaya
+# pilihan di UI tetap satu daftar; mesin transkripsi dipilih di audio.py.
+WHISPER_MLX_MODELS = {
+    "base": "models/whisper-mlx/base",
+    "small": "models/whisper-mlx/small",
+    "large-v3-turbo": "models/whisper-mlx/large-v3-turbo",
 }
 
 LLM_MODELS = {
@@ -37,13 +99,45 @@ LLM_MODELS = {
     "qwen2.5-3b-instruct-q4_k_m": "models/llm/qwen2.5-3b-instruct-q4_k_m.gguf",
 }
 
+
+def _default_whisper_model() -> str:
+    """Mac Apple Silicon: large-v3-turbo bila bobot MLX-nya terpasang dan paket
+    mlx-whisper ada (paling akurat dan tetap ±0,5 s per klip di GPU M4 Pro).
+    Selain itu small (asli). Bila MLX ternyata tidak bisa dimuat saat jalan,
+    audio.whisper_backend() memakai small di CPU sebagai cadangan."""
+    if not IS_APPLE_SILICON:
+        return "small"
+    import importlib.util
+
+    turbo = BASE_DIR / WHISPER_MLX_MODELS["large-v3-turbo"]
+    weights = (turbo / "weights.safetensors").exists() or (turbo / "weights.npz").exists()
+    try:
+        has_pkg = importlib.util.find_spec("mlx_whisper") is not None
+    except Exception:
+        has_pkg = False
+    if (turbo / "config.json").exists() and weights and has_pkg:
+        return "large-v3-turbo"
+    return "small"
+
+
+# Perangkat Whisper yang berlaku di platform ini (pilihan di tab Pengaturan).
+WHISPER_DEVICES = ("auto", "mlx", "cpu") if IS_APPLE_SILICON else ("auto", "cuda", "cpu")
+
 DEFAULTS = {
-    "whisper_model": "small",
-    "whisper_device": "auto",      # auto | cuda | cpu
+    "whisper_model": _default_whisper_model(),
+    "whisper_device": "auto",      # auto | cuda | cpu | mlx (GPU Apple Silicon)
     "whisper_compute": "auto",     # auto | float16 | int8_float16 | int8
     "llm_model": "qwen2.5-3b-instruct-q4_k_m",
     "llm_ctx": 4096,
     "llm_gpu_layers": -1,          # -1 = semua layer ke GPU bila tersedia
+    # True: generate tanpa grammar JSON dulu, grammar hanya bila keluaran bukan
+    # objek JSON (diukur di M4 Pro: 50/50 valid, analisis ~2x lebih cepat).
+    # False = perilaku asli (selalu grammar). Default menyala hanya di Apple
+    # Silicon karena baru diverifikasi di sana.
+    "llm_fast_json": IS_APPLE_SILICON,
+    # Muat model di latar belakang saat app mulai supaya transmisi pertama
+    # tidak menanggung waktu muat/kompilasi kernel GPU (lihat pipeline.warmup).
+    "warmup": IS_APPLE_SILICON,
     "llm_timeout": 120,
     "language": "id",
 }
@@ -94,13 +188,31 @@ def load_config() -> dict:
                 cfg.update({k: v for k, v in saved.items() if k in DEFAULTS})
         except Exception:
             pass
+    # Perangkat yang tidak berlaku di platform ini (mis. config.json "cuda" dibawa
+    # dari laptop Windows ke Mac) -> auto, supaya UI, status, dan mesin sejalan.
+    if cfg.get("whisper_device") not in WHISPER_DEVICES:
+        cfg["whisper_device"] = "auto"
     return cfg
 
 
+def _saved_keys() -> set[str]:
+    try:
+        import json
+
+        saved = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        return set(saved) if isinstance(saved, dict) else set()
+    except Exception:
+        return set()
+
+
 def save_config(cfg: dict) -> None:
+    """Simpan hanya nilai yang memang diubah (beda dari default) atau yang sudah
+    ada di config.json. Default yang bergantung platform/instalasi
+    (whisper_model, llm_fast_json, warmup) jadi tidak terkunci di berkas."""
     import json
 
-    clean = {k: cfg[k] for k in DEFAULTS if k in cfg}
+    on_disk = _saved_keys()
+    clean = {k: cfg[k] for k in DEFAULTS if k in cfg and (k in on_disk or cfg[k] != DEFAULTS[k])}
     CONFIG_FILE.write_text(json.dumps(clean, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
@@ -177,15 +289,24 @@ DEMO_BANNER = "SEMUA DATA LOKASI = DEMO DATA. Tidak ada komunikasi militer asli.
 
 
 def model_path(name: str, kind: str) -> Path:
-    """Path absolut model lokal."""
+    """Path absolut model lokal. kind: whisper | whisper-mlx | llm."""
     if kind == "whisper":
         return BASE_DIR / WHISPER_MODELS.get(name, f"models/whisper/{name}")
+    if kind == "whisper-mlx":
+        return BASE_DIR / WHISPER_MLX_MODELS.get(name, f"models/whisper-mlx/{name}")
     return BASE_DIR / LLM_MODELS.get(name, f"models/llm/{name}.gguf")
 
 
 def whisper_installed(name: str) -> bool:
     p = model_path(name, "whisper")
     return (p / "model.bin").exists()
+
+
+def whisper_mlx_installed(name: str) -> bool:
+    """True bila bobot MLX lengkap (config.json + weights.safetensors/npz)."""
+    p = model_path(name, "whisper-mlx")
+    return (p / "config.json").exists() and (
+        (p / "weights.safetensors").exists() or (p / "weights.npz").exists())
 
 
 def llm_installed(name: str) -> bool:
@@ -195,25 +316,42 @@ def llm_installed(name: str) -> bool:
 
 def device_info() -> dict:
     """Info runtime untuk ditampilkan di UI (tidak meng-crash bila tidak ada GPU)."""
-    info = {"cuda": False, "gpu": None, "llama_cpp": False, "llama_cpp_gpu": False}
+    info = {"cuda": False, "gpu": None, "llama_cpp": False, "llama_cpp_gpu": False,
+            "apple_silicon": IS_APPLE_SILICON, "mlx": False, "mlx_whisper": False,
+            "perf_cores": perf_cores()}
     try:
         import ctranslate2
 
         info["cuda"] = ctranslate2.get_cuda_device_count() > 0
     except Exception:
         pass
-    try:
-        import subprocess
+    if IS_MAC:
+        chip = _sysctl("machdep.cpu.brand_string")
+        if chip and IS_APPLE_SILICON:
+            info["gpu"] = f"{chip} (GPU terintegrasi, Metal)"
+        try:
+            import mlx.core as mx
 
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if out.returncode == 0 and out.stdout.strip():
-            info["gpu"] = out.stdout.strip().splitlines()[0]
-            info["cuda"] = True
-    except Exception:
-        pass
+            info["mlx"] = bool(mx.metal.is_available())
+        except Exception:
+            pass
+        try:
+            import importlib.util
+
+            info["mlx_whisper"] = importlib.util.find_spec("mlx_whisper") is not None
+        except Exception:
+            pass
+    else:
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                info["gpu"] = out.stdout.strip().splitlines()[0]
+                info["cuda"] = True
+        except Exception:
+            pass
     try:
         import llama_cpp
 

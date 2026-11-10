@@ -1,0 +1,21 @@
+# GARUDA Radio AI - tambahan khusus macOS Apple Silicon (M1-M4), dipasang setup.sh
+# Python 3.11 / 3.12 arm64 (dites di 3.12.13, macOS, Mac mini M4 Pro).
+#
+# Transkripsi di GPU Apple (Metal) lewat MLX. Dependensi dasar tetap requirements.txt.
+#
+# mlx-whisper SENDIRI dipasang setup.sh dengan --no-deps: metadata paketnya
+# mewajibkan torch (+-600 MB, plus sympy/networkx) yang hanya dipakai untuk
+# konversi bobot (mlx_whisper/torch_whisper.py), tidak pernah di jalur
+# transkripsi. Di bawah ini dependensi yang benar-benar di-import saat jalan.
+#
+# llama-cpp-python juga TIDAK dipin di sini (sama seperti Windows): setup.sh
+# membangunnya dengan Metal (CMAKE_ARGS="-DGGML_METAL=on").
+
+# Pin numpy<2 diulang di sini: pip memasang berkas ini dalam proses terpisah dan
+# tanpa pin, scipy>=1.18 (Python 3.12) diam-diam meng-upgrade numpy ke 2.x.
+numpy>=1.24,<2
+mlx==0.32.4               # runtime MLX (Metal); butuh macOS 14+
+numba>=0.60               # mlx_whisper.timing (di-import saat load)
+scipy>=1.11               # mlx_whisper.timing
+tiktoken>=0.7             # tokenizer Whisper
+tqdm>=4.66
